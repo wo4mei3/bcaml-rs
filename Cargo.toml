@@ -1,0 +1,12 @@
+[package]
+name = "bcaml-rs"
+version = "0.7.0"
+edition = "2024"
+
+[build-dependencies]
+lalrpop = "0.20"
+
+[dependencies]
+lalrpop = "0.20"
+lalrpop-util = { version = "0.20", features = ["lexer"] }
+logos = "0.14"

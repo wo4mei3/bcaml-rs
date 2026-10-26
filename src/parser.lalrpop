@@ -1,0 +1,735 @@
+
+
+use crate::ast::*;
+use crate::token::{Tok, LexicalError};
+use lalrpop_util::ParseError;
+
+grammar;
+
+extern {
+    type Location = usize;
+    type Error = LexicalError;
+
+    enum Tok {
+        "ident"       => Tok::Ident(<String>),
+        "prefixop"    => Tok::PrefixOp(<String>),
+        "infix"       => Tok::Infix(<String>),
+        "infix0"      => Tok::Infix0(<String>),
+        "infix1"      => Tok::Infix1(<String>),
+        "infix2"      => Tok::Infix2(<String>),
+        "subtractive" => Tok::Subtractive(<String>),
+        "infix3"      => Tok::Infix3(<String>),
+        "infix4"      => Tok::Infix4(<String>),
+
+        "int"    => Tok::Int(<i64>),
+        "char"   => Tok::Char(<char>),
+        "float"  => Tok::Float(<f64>),
+        "string" => Tok::Str(<String>),
+
+        "="  => Tok::Equal,
+        "==" => Tok::EqualEqual,
+        "#"  => Tok::Sharp,
+        "&"  => Tok::Ampersand,
+        "'"  => Tok::Quote,
+        "("  => Tok::LParen,
+        ")"  => Tok::RParen,
+        "*"  => Tok::Star,
+        ","  => Tok::Comma,
+        "->" => Tok::MinusGreater,
+        "."  => Tok::Dot,
+        ".." => Tok::DotDot,
+        ".(" => Tok::DotLParen,
+        ".[" => Tok::DotLBracket,
+        ":"  => Tok::Colon,
+        "::" => Tok::ColonColon,
+        ":=" => Tok::ColonEqual,
+        ";"  => Tok::Semi,
+        ";;" => Tok::SemiSemi,
+        "["  => Tok::LBracket,
+        "[|" => Tok::LBracketBar,
+        "<-" => Tok::LessMinus,
+        "]"  => Tok::RBracket,
+        "_"  => Tok::Underscore,
+        "__" => Tok::UnderUnder,
+        "{"  => Tok::LBrace,
+        "|"  => Tok::Bar,
+        "|]" => Tok::BarRBracket,
+        "}"  => Tok::RBrace,
+        "&&" => Tok::AmperAmper,
+        "||" => Tok::BarBar,
+
+        "and"       => Tok::And,
+        "as"        => Tok::As,
+        "begin"     => Tok::Begin,
+        "do"        => Tok::Do,
+        "done"      => Tok::Done,
+        "downto"    => Tok::Downto,
+        "else"      => Tok::Else,
+        "end"       => Tok::End,
+        "exception" => Tok::Exception,
+        "for"       => Tok::For,
+        "fun"       => Tok::Fun,
+        "function"  => Tok::Function,
+        "if"        => Tok::If,
+        "in"        => Tok::In,
+        "let"       => Tok::Let,
+        "match"     => Tok::Match,
+        "mutable"   => Tok::Mutable,
+        "not"       => Tok::Not,
+        "of"        => Tok::Of,
+        "or"        => Tok::Or,
+        "prefix"    => Tok::Pref,
+        "rec"       => Tok::Rec,
+        "then"      => Tok::Then,
+        "to"        => Tok::To,
+        "try"       => Tok::Try,
+        "type"      => Tok::Type,
+        "value"     => Tok::Value,
+        "when"      => Tok::When,
+        "while"     => Tok::While,
+        "with"      => Tok::With,
+    }
+}
+
+
+
+
+
+pub Implementation: Vec<ImplPhrase> = {
+    <mut phrases:Implementation> <phrase:ImplementationPhrase> => {
+        phrases.push(phrase);
+        phrases
+    },
+    => vec![],
+};
+
+ImplementationPhrase: ImplPhrase = {
+    <e:Expr> ";;"                       => ImplPhrase::Expr(e),
+    "let" <b:LetBindings> ";;"         => ImplPhrase::LetDef(false, b),
+    "let" "rec" <b:LetBindings> ";;"   => ImplPhrase::LetDef(true, b),
+    "type" <d:TypeDeclList> ";;"       => ImplPhrase::TypeDef(d),
+    "exception" <d:ExcDecl> ";;"       => ImplPhrase::ExcDef(d),
+    "#" <d:Directive> ";;"             => ImplPhrase::Directive(d),
+};
+
+pub Interface: Option<IntfPhrase> = {
+    "value" <d:ValueDecl> ";;"     => Some(IntfPhrase::ValueDecl(d)),
+    "type" <d:TypeDeclList> ";;"   => Some(IntfPhrase::TypeDecl(d)),
+    "exception" <d:ExcDecl> ";;"   => Some(IntfPhrase::ExcDecl(d)),
+    "#" <d:Directive> ";;"         => Some(IntfPhrase::Directive(d)),
+    =>                                None,
+};
+
+
+
+
+
+
+
+
+
+pub Expr: Expr = {
+    ExprC,
+    ExprO,
+};
+
+ExprC: Expr = {
+    ExprSeqC,
+};
+
+ExprO: Expr = {
+    ExprSeqO,
+    LetForm,
+};
+
+LetForm: Expr = {
+    <l:@L> "let" <b:LetBindings> "in" <body:Expr> <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::Let(false, b, Box::new(body))),
+    <l:@L> "let" "rec" <b:LetBindings> "in" <body:Expr> <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::Let(true, b, Box::new(body))),
+    <l:@L> "fun" OptBar <m:FunMatch> <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::Function(m)),
+    <l:@L> "function" OptBar <m:FunctionMatch> <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::Function(m)),
+    <l:@L> "match" <scrut:Expr> "with" OptBar <m:FunctionMatch> <r:@R> => {
+        let loc = Loc::new(l, r);
+        let f = expr(loc, ExprDesc::Function(m));
+        expr(loc, ExprDesc::Apply(Box::new(f), vec![scrut]))
+    },
+    <l:@L> "try" <scrut:Expr> "with" OptBar <m:TryMatch> <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::TryWith(Box::new(scrut), m)),
+};
+
+
+ExprSeqC: Expr = {
+    <l:@L> <a:ExprIf> ";" <b:ExprSeqC> <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::Sequence(Box::new(a), Box::new(b))),
+    <a:ExprIf> ";" => a,
+    ExprIf,
+};
+
+ExprSeqO: Expr = {
+    <l:@L> <a:ExprIf> ";" <b:ExprSeqO> <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::Sequence(Box::new(a), Box::new(b))),
+    <l:@L> <a:ExprIf> ";" <b:LetForm> <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::Sequence(Box::new(a), Box::new(b))),
+};
+
+
+
+ExprIf: Expr = {
+    ExprIfOpen,
+    ExprIfClosed,
+};
+
+ExprIfOpen: Expr = {
+    <l:@L> "if" <c:Expr> "then" <t:ExprIf> <r:@R> => {
+        let loc = Loc::new(l, r);
+        expr(loc, ExprDesc::Condition(Box::new(c), Box::new(t), Box::new(void(loc))))
+    },
+    <l:@L> "if" <c:Expr> "then" <t:ExprIfClosed> "else" <e:ExprIfOpen> <r:@R>
+        => expr(Loc::new(l, r),
+                ExprDesc::Condition(Box::new(c), Box::new(t), Box::new(e))),
+};
+
+ExprIfClosed: Expr = {
+    <l:@L> "if" <c:Expr> "then" <t:ExprIfClosed> "else" <e:ExprIfClosed> <r:@R>
+        => expr(Loc::new(l, r),
+                ExprDesc::Condition(Box::new(c), Box::new(t), Box::new(e))),
+    <l:@L> "while" <c:Expr> "do" <body:Expr> "done" <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::While(Box::new(c), Box::new(body))),
+    <l:@L> "while" <c:Expr> "do" "done" <r:@R> => {
+        let loc = Loc::new(l, r);
+        expr(loc, ExprDesc::While(Box::new(c), Box::new(void(loc))))
+    },
+    <l:@L> "for" <v:Ide> "=" <a:Expr> <up:Direction> <b:Expr> "do" <body:Expr> "done" <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::For {
+               var: v,
+               start: Box::new(a),
+               stop: Box::new(b),
+               up,
+               body: Box::new(body),
+           }),
+    <l:@L> "for" <v:Ide> "=" <a:Expr> <up:Direction> <b:Expr> "do" "done" <r:@R> => {
+        let loc = Loc::new(l, r);
+        expr(loc, ExprDesc::For { var: v, start: Box::new(a), stop: Box::new(b),
+                                  up, body: Box::new(void(loc)) })
+    },
+    ExprAssign,
+};
+
+Direction: bool = {
+    "to"     => true,
+    "downto" => false,
+};
+
+
+ExprAssign: Expr = {
+    <l:@L> <lhs:ExprComma> ":=" <rhs:ExprAssign> <r:@R>
+        => binop(Loc::new(l, r), ":=", lhs, rhs),
+    <l:@L> <lhs:SimpleExpr> "<-" <rhs:ExprAssign> <r:@R> =>? {
+        make_assign(Loc::new(l, r), lhs, rhs)
+            .map_err(|msg| ParseError::User {
+                error: LexicalError::SyntaxError { at: l, msg },
+            })
+    },
+    ExprComma,
+};
+
+
+ExprComma: Expr = {
+    <l:@L> <v:ExprCommaList> <r:@R> => expr(Loc::new(l, r), ExprDesc::Tuple(v)),
+    ExprOr,
+};
+
+ExprCommaList: Vec<Expr> = {
+    <a:ExprOr> "," <b:ExprOr>            => vec![a, b],
+    <mut v:ExprCommaList> "," <e:ExprOr> => { v.push(e); v },
+};
+
+
+ExprOr: Expr = {
+    <l:@L> <a:ExprOr> "or" <b:ExprAnd> <r:@R>   => binop(Loc::new(l, r), "or", a, b),
+    <l:@L> <a:ExprOr> "||" <b:ExprAnd> <r:@R>   => binop(Loc::new(l, r), "||", a, b),
+    ExprAnd,
+};
+
+ExprAnd: Expr = {
+    <l:@L> <a:ExprAnd> "&" <b:ExprNot> <r:@R>   => binop(Loc::new(l, r), "&", a, b),
+    <l:@L> <a:ExprAnd> "&&" <b:ExprNot> <r:@R>  => binop(Loc::new(l, r), "&&", a, b),
+    ExprNot,
+};
+
+ExprNot: Expr = {
+    <l:@L> "not" <a:ExprNot> <r:@R> => unop(Loc::new(l, r), "not", a),
+    ExprCmp,
+};
+
+ExprCmp: Expr = {
+    <l:@L> <a:ExprCmp> <op:"infix0"> <b:ExprConcat> <r:@R>
+        => binop(Loc::new(l, r), &op, a, b),
+    <l:@L> <a:ExprCmp> "=" <b:ExprConcat> <r:@R>  => binop(Loc::new(l, r), "=", a, b),
+    <l:@L> <a:ExprCmp> "==" <b:ExprConcat> <r:@R> => binop(Loc::new(l, r), "==", a, b),
+    ExprConcat,
+};
+
+ExprConcat: Expr = {
+    <l:@L> <a:ExprCons> <op:"infix1"> <b:ExprConcat> <r:@R>
+        => binop(Loc::new(l, r), &op, a, b),
+    ExprCons,
+};
+
+ExprCons: Expr = {
+    <l:@L> <a:ExprAdd> "::" <b:ExprCons> <r:@R> => {
+        let loc = Loc::new(l, r);
+        let cell = expr(loc, ExprDesc::Tuple(vec![a, b]));
+        expr(loc, ExprDesc::Construct1(GlobalRef::Name(CONSTR_CONS.to_string()),
+                                       Box::new(cell)))
+    },
+    ExprAdd,
+};
+
+ExprAdd: Expr = {
+    <l:@L> <a:ExprAdd> <op:"infix2"> <b:ExprMul> <r:@R>
+        => binop(Loc::new(l, r), &op, a, b),
+    <l:@L> <a:ExprAdd> <op:"subtractive"> <b:ExprMul> <r:@R>
+        => binop(Loc::new(l, r), &op, a, b),
+    ExprMul,
+};
+
+ExprMul: Expr = {
+    <l:@L> <a:ExprMul> "*" <b:ExprPow> <r:@R> => binop(Loc::new(l, r), "*", a, b),
+    <l:@L> <a:ExprMul> <op:"infix3"> <b:ExprPow> <r:@R>
+        => binop(Loc::new(l, r), &op, a, b),
+    ExprPow,
+};
+
+ExprPow: Expr = {
+    <l:@L> <a:ExprNeg> <op:"infix4"> <b:ExprPow> <r:@R>
+        => binop(Loc::new(l, r), &op, a, b),
+    ExprNeg,
+};
+
+ExprNeg: Expr = {
+    <l:@L> <op:"subtractive"> <a:ExprNeg> <r:@R> => unary_minus(Loc::new(l, r), &op, a),
+    ExprInfix,
+};
+
+ExprInfix: Expr = {
+    <l:@L> <a:ExprInfix> <op:"infix"> <b:ExprApp> <r:@R>
+        => binop(Loc::new(l, r), &op, a, b),
+    ExprApp,
+};
+
+
+ExprApp: Expr = {
+    <l:@L> <f:SimpleExpr> <args:SimpleExprList> <r:@R> => apply(Loc::new(l, r), f, args),
+    SimpleExpr,
+};
+
+SimpleExprList: Vec<Expr> = {
+    <e:SimpleExpr> <mut v:SimpleExprList> => { v.insert(0, e); v },
+    <e:SimpleExpr>                        => vec![e],
+};
+
+
+
+SimpleExpr: Expr = {
+    <l:@L> <e:SimpleExpr> "." <f:ExtIdent> <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::RecordAccess(Box::new(e), find_label(f))),
+    <l:@L> <e:SimpleExpr> ".(" <i:Expr> ")" <r:@R>
+        => binop(Loc::new(l, r), "vect_item", e, i),
+    <l:@L> <e:SimpleExpr> ".[" <i:Expr> "]" <r:@R>
+        => binop(Loc::new(l, r), "nth_char", e, i),
+    SimpleAtom,
+};
+
+SimpleAtom: Expr = {
+    <l:@L> <c:StructConstant> <r:@R> => expr(Loc::new(l, r), ExprDesc::Constant(c)),
+    <l:@L> <i:ExtIdent> <r:@R>       => expr_constr_or_ident(Loc::new(l, r), i),
+    <l:@L> "[" <v:ExprSmList> "]" <r:@R>   => make_list(Loc::new(l, r), v),
+    <l:@L> "[|" <mut v:ExprSmList> "|]" <r:@R> => {
+        v.reverse();
+        expr(Loc::new(l, r), ExprDesc::Vector(v))
+    },
+    <l:@L> "(" <e:Expr> ":" <t:Type> ")" <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::Constraint(Box::new(e), t)),
+    "(" <e:Expr> ")" => e,
+    <l:@L> "(" ")" <r:@R> => void(Loc::new(l, r)),
+    "begin" <e:Expr> "end" => e,
+    <l:@L> "begin" "end" <r:@R> => void(Loc::new(l, r)),
+    <l:@L> "{" <f:ExprLabelList> "}" <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::Record(f)),
+    PrefixExpr,
+};
+
+
+PrefixExpr: Expr = {
+    <l:@L> <op:"prefixop"> <e:SimpleAtom> <r:@R>  => unop(Loc::new(l, r), &op, e),
+};
+
+ExprSmList: Vec<Expr> = {
+    =>                                    vec![],
+    <v:ExprSmNonEmpty>                 => v,
+    <v:ExprSmNonEmpty> ";"             => v,
+};
+
+ExprSmNonEmpty: Vec<Expr> = {
+    <e:ExprIf>                              => vec![e],
+    <mut v:ExprSmNonEmpty> ";" <e:ExprIf>   => { v.push(e); v },
+};
+
+ExprLabel: (GlobalRef, Expr) = {
+    <i:ExtIdent> "=" <e:ExprIf> => (find_label(i), e),
+};
+
+ExprLabelList: Vec<(GlobalRef, Expr)> = {
+    <v:ExprLabelNonEmpty>     => v,
+    <v:ExprLabelNonEmpty> ";" => v,
+};
+
+ExprLabelNonEmpty: Vec<(GlobalRef, Expr)> = {
+    <e:ExprLabel>                                 => vec![e],
+    <mut v:ExprLabelNonEmpty> ";" <e:ExprLabel>   => { v.push(e); v },
+};
+
+
+
+
+StructConstant: StructConstant = {
+    <c:AtomicConstant> => StructConstant::Atom(c),
+};
+
+AtomicConstant: AtomicConstant = {
+    <n:"int">    => AtomicConstant::Int(n),
+    <f:"float">  => AtomicConstant::Float(f),
+    <s:"string"> => AtomicConstant::Str(s),
+    <c:"char">   => AtomicConstant::Char(c),
+};
+
+
+
+
+
+OptBar: () = {
+    "|" => (),
+    =>     (),
+};
+
+Action<E>: Expr = {
+    "->" <e:E> => e,
+    <l:@L> "when" <g:ExprC> "->" <e:E> <r:@R>
+        => expr(Loc::new(l, r), ExprDesc::When(Box::new(g), Box::new(e))),
+};
+
+
+FunMatch: Vec<MatchCase> = {
+    FunMatchC,
+    <mut v:FunMatchC> "|" <a:FunArmO> => { v.push(a); v },
+    <a:FunArmO>                       => vec![a],
+};
+FunMatchC: Vec<MatchCase> = {
+    <a:FunArmC>                            => vec![a],
+    <mut v:FunMatchC> "|" <a:FunArmC>      => { v.push(a); v },
+};
+FunArmC: MatchCase = { <p:SimplePatternList> <a:Action<ExprC>> => (p, a) };
+FunArmO: MatchCase = { <p:SimplePatternList> <a:Action<ExprO>> => (p, a) };
+
+FunctionMatch: Vec<MatchCase> = {
+    FunctionMatchC,
+    <mut v:FunctionMatchC> "|" <a:FunctionArmO> => { v.push(a); v },
+    <a:FunctionArmO>                            => vec![a],
+};
+FunctionMatchC: Vec<MatchCase> = {
+    <a:FunctionArmC>                          => vec![a],
+    <mut v:FunctionMatchC> "|" <a:FunctionArmC> => { v.push(a); v },
+};
+FunctionArmC: MatchCase = { <p:Pattern> <a:Action<ExprC>> => (vec![p], a) };
+FunctionArmO: MatchCase = { <p:Pattern> <a:Action<ExprO>> => (vec![p], a) };
+
+TryMatch: Vec<(Pattern, Expr)> = {
+    TryMatchC,
+    <mut v:TryMatchC> "|" <a:TryArmO> => { v.push(a); v },
+    <a:TryArmO>                       => vec![a],
+};
+TryMatchC: Vec<(Pattern, Expr)> = {
+    <a:TryArmC>                       => vec![a],
+    <mut v:TryMatchC> "|" <a:TryArmC> => { v.push(a); v },
+};
+TryArmC: (Pattern, Expr) = { <p:Pattern> <a:Action<ExprC>> => (p, a) };
+TryArmO: (Pattern, Expr) = { <p:Pattern> <a:Action<ExprO>> => (p, a) };
+
+
+LetBindings: Vec<Binding> = {
+    <b:Binding<ExprSeqC>> "and" <mut rest:LetBindings> => { rest.insert(0, b); rest },
+    <b:Binding<Expr>>                                  => vec![b],
+};
+
+Binding<E>: Binding = {
+    <p:Pattern> "=" <e:E> => (p, e),
+};
+
+
+
+
+Pattern: Pattern = {
+    <l:@L> <p:Pattern> "as" <i:"ident"> <r:@R>
+        => pat(Loc::new(l, r), PatternDesc::Alias(Box::new(p), i)),
+    PatternOr,
+};
+
+PatternOr: Pattern = {
+    <l:@L> <a:PatternOr> "|" <b:PatternComma> <r:@R>
+        => pat(Loc::new(l, r), PatternDesc::Or(Box::new(a), Box::new(b))),
+    PatternComma,
+};
+
+PatternComma: Pattern = {
+    <l:@L> <v:PatternCommaList> <r:@R> => pat(Loc::new(l, r), PatternDesc::Tuple(v)),
+    PatternCons,
+};
+
+PatternCommaList: Vec<Pattern> = {
+    <a:PatternCons> "," <b:PatternCons>        => vec![a, b],
+    <mut v:PatternCommaList> "," <p:PatternCons> => { v.push(p); v },
+};
+
+PatternCons: Pattern = {
+    <l:@L> <a:PatternApp> "::" <b:PatternCons> <r:@R> => {
+        let loc = Loc::new(l, r);
+        let cell = pat(loc, PatternDesc::Tuple(vec![a, b]));
+        pat(loc, PatternDesc::Construct1(
+            GlobalRef::Name(CONSTR_CONS.to_string()), Box::new(cell)))
+    },
+    PatternApp,
+};
+
+PatternApp: Pattern = {
+    <l:@L> <head:SimplePattern> <args:SimplePatternList> <r:@R>
+        => pat(Loc::new(l, r), PatternDesc::App(Box::new(head), args)),
+    SimplePattern,
+};
+
+SimplePatternList: Vec<Pattern> = {
+    <p:SimplePattern> <mut v:SimplePatternList> => { v.insert(0, p); v },
+    <p:SimplePattern>                           => vec![p],
+};
+
+SimplePattern: Pattern = {
+    <l:@L> <a:"char"> ".." <b:"char"> <r:@R> => make_range_pat(Loc::new(l, r), a, b),
+    <l:@L> <c:"char"> <r:@R>
+        => pat(Loc::new(l, r), PatternDesc::Constant(AtomicConstant::Char(c))),
+    <l:@L> <n:"int"> <r:@R>
+        => pat(Loc::new(l, r), PatternDesc::Constant(AtomicConstant::Int(n))),
+    <l:@L> <f:"float"> <r:@R>
+        => pat(Loc::new(l, r), PatternDesc::Constant(AtomicConstant::Float(f))),
+    <l:@L> <t:"string"> <r:@R>
+        => pat(Loc::new(l, r), PatternDesc::Constant(AtomicConstant::Str(t))),
+    <l:@L> "subtractive" <n:"int"> <r:@R>
+        => pat(Loc::new(l, r), PatternDesc::Constant(AtomicConstant::Int(-n))),
+    <l:@L> "subtractive" <f:"float"> <r:@R>
+        => pat(Loc::new(l, r), PatternDesc::Constant(AtomicConstant::Float(-f))),
+    <l:@L> "_" <r:@R>       => pat(Loc::new(l, r), PatternDesc::Wild),
+    <l:@L> <i:Ide> <r:@R>   => pat_constr_or_var(Loc::new(l, r), i),
+    <l:@L> <q:QualIdent> <r:@R>
+        => pat(Loc::new(l, r),
+               PatternDesc::Construct0(find_constructor(GlobalRef::Modname(q)))),
+    <l:@L> "(" ")" <r:@R>
+        => pat(Loc::new(l, r),
+               PatternDesc::Construct0(GlobalRef::Name(CONSTR_VOID.to_string()))),
+    <l:@L> "[" <v:PatternSmList> "]" <r:@R> => make_listpat(Loc::new(l, r), v),
+    <l:@L> "(" <p:Pattern> ":" <t:Type> ")" <r:@R>
+        => pat(Loc::new(l, r), PatternDesc::Constraint(Box::new(p), t)),
+    <l:@L> "{" <f:PatternLabelList> "}" <r:@R> => make_recordpat(Loc::new(l, r), f),
+    "(" <p:Pattern> ")" => p,
+};
+
+PatternSmList: Vec<Pattern> = {
+    =>                              vec![],
+    <v:PatternSmNonEmpty>        => v,
+    <v:PatternSmNonEmpty> ";"    => v,
+};
+
+PatternSmNonEmpty: Vec<Pattern> = {
+    <p:Pattern>                                 => vec![p],
+    <mut v:PatternSmNonEmpty> ";" <p:Pattern>   => { v.push(p); v },
+};
+
+PatternLabel: (GlobalRef, Pattern) = {
+    <i:ExtIdent> "=" <p:Pattern> => (find_label(i), p),
+};
+
+PatternLabelList: Vec<(GlobalRef, Pattern)> = {
+    =>                              vec![],
+    "_" =>                          vec![],
+    <v:PatternLabelNonEmpty>     => v,
+    <v:PatternLabelNonEmpty> ";" => v,
+};
+
+PatternLabelNonEmpty: Vec<(GlobalRef, Pattern)> = {
+    <p:PatternLabel>                                   => vec![p],
+    <mut v:PatternLabelNonEmpty> ";" <p:PatternLabel>  => { v.push(p); v },
+};
+
+
+
+
+
+
+
+
+Ide: Ident = {
+    <i:"ident">      => i,
+    "prefix" <o:Infx> => o,
+};
+
+Infx: String = {
+    <s:"infix">       => s,
+    <s:"infix0">      => s,
+    <s:"infix1">      => s,
+    <s:"infix2">      => s,
+    <s:"infix3">      => s,
+    <s:"infix4">      => s,
+    <s:"subtractive"> => s,
+    <s:"prefixop">    => s,
+    "*"  => "*".to_string(),
+    "::" => "::".to_string(),
+    ":=" => ":=".to_string(),
+    "="  => "=".to_string(),
+    "==" => "==".to_string(),
+    "not"=> "not".to_string(),
+    "&"  => "&".to_string(),
+    "&&" => "&&".to_string(),
+    "or" => "or".to_string(),
+    "||" => "||".to_string(),
+};
+
+QualIdent: QualIdent = {
+    <q:"ident"> "__" <i:Ide> => QualIdent { qual: q, id: i },
+};
+
+ExtIdent: GlobalRef = {
+    <q:QualIdent> => GlobalRef::Modname(q),
+    <i:Ide>       => GlobalRef::Name(i),
+};
+
+
+
+
+Type: TypeExpr = {
+    <l:@L> <a:TypeTuple> "->" <b:Type> <r:@R>
+        => typ(Loc::new(l, r), TypeDesc::Arrow(Box::new(a), Box::new(b))),
+    TypeTuple,
+};
+
+TypeTuple: TypeExpr = {
+    <l:@L> <v:TypeStarList> <r:@R> => typ(Loc::new(l, r), TypeDesc::Tuple(v)),
+    SimpleType,
+};
+
+TypeStarList: Vec<TypeExpr> = {
+    <a:SimpleType> "*" <b:SimpleType>          => vec![a, b],
+    <mut v:TypeStarList> "*" <t:SimpleType>    => { v.push(t); v },
+};
+
+SimpleType: TypeExpr = {
+    <l:@L> <v:TypeVar> <r:@R>  => typ(Loc::new(l, r), TypeDesc::Var(v)),
+    <l:@L> <c:ExtIdent> <r:@R> => typ(Loc::new(l, r), TypeDesc::Constr(c, vec![])),
+    <l:@L> <a:SimpleType> <c:ExtIdent> <r:@R>
+        => typ(Loc::new(l, r), TypeDesc::Constr(c, vec![a])),
+    <l:@L> "(" <a:Type> "," <mut rest:TypeCommaList> ")" <c:ExtIdent> <r:@R> => {
+        rest.insert(0, a);
+        typ(Loc::new(l, r), TypeDesc::Constr(c, rest))
+    },
+    "(" <t:Type> ")" => t,
+};
+
+TypeVar: Ident = {
+    "'" <i:"ident"> => i,
+};
+
+TypeCommaList: Vec<TypeExpr> = {
+    <mut v:TypeCommaList> "," <t:Type> => { v.push(t); v },
+    <t:Type>                            => vec![t],
+};
+
+
+
+
+ValueDecl: Vec<ValueDecl> = {
+    <d:Value1Decl> "and" <mut rest:ValueDecl> => { rest.insert(0, d); rest },
+    <d:Value1Decl>                            => vec![d],
+};
+
+TypeDeclList: Vec<TypeDecl> = {
+    <d:Type1Decl> "and" <mut rest:TypeDeclList> => { rest.insert(0, d); rest },
+    <d:Type1Decl>                               => vec![d],
+};
+
+ExcDecl: Vec<ConstrDecl> = {
+    <d:Constr1Decl> "and" <mut rest:ExcDecl> => { rest.insert(0, d); rest },
+    <d:Constr1Decl>                          => vec![d],
+};
+
+ConstrDecl: Vec<ConstrDecl> = {
+    <d:Constr1Decl> "|" <mut rest:ConstrDecl> => { rest.insert(0, d); rest },
+    <d:Constr1Decl>                           => vec![d],
+};
+
+LabelDeclList: Vec<LabelDecl> = {
+    <mut v:LabelDeclList> ";" <d:Label1Decl> => { v.push(d); v },
+    <mut v:LabelDeclList> ";"                => v,
+    <d:Label1Decl>                            => vec![d],
+};
+
+Value1Decl: ValueDecl = {
+    <i:Ide> ":" <t:Type>                       => (i, t, PrimDecl::NotPrim),
+    <i:Ide> ":" <t:Type> "=" <p:PrimDecl>      => (i, t, p),
+};
+
+PrimDecl: PrimDecl = {
+    <arity:"int"> <name:"string"> => find_primitive(arity, name),
+};
+
+Type1Decl: TypeDecl = {
+    <params:TypeParams> <name:"ident"> <def:Type1Def> => (name, params, def),
+};
+
+Type1Def: TypeDef = {
+    =>                                       TypeDef::Abstract,
+    "=" OptBar <c:ConstrDecl>             => TypeDef::Variant(c),
+    "=" "{" <l:LabelDeclList> "}"         => TypeDef::Record(l),
+    "==" <t:Type>                         => TypeDef::Abbrev(t),
+};
+
+Constr1Decl: ConstrDecl = {
+    <i:Ide> "of" <m:MutableOption> <t:Type> => ConstrDecl::Constr1(i, t, m),
+    <i:Ide>                                 => ConstrDecl::Constr0(i),
+};
+
+Label1Decl: LabelDecl = {
+    <m:MutableOption> <name:"ident"> ":" <t:Type> => (name, t, m),
+};
+
+MutableOption: Mutability = {
+    "mutable" => Mutability::Mutable,
+    =>           Mutability::Notmutable,
+};
+
+TypeParams: Vec<Ident> = {
+    "(" <v:TypeVarList> ")" => v,
+    <v:TypeVar>             => vec![v],
+    =>                         vec![],
+};
+
+TypeVarList: Vec<Ident> = {
+    <v:TypeVar> "," <mut rest:TypeVarList> => { rest.insert(0, v); rest },
+    <v:TypeVar>                            => vec![v],
+};
+
+
+
+
+Directive: Directive = {
+    <name:"ident"> <arg:"string"> => Directive { name, arg },
+};
