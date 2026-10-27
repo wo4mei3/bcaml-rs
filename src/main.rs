@@ -16,7 +16,7 @@ use ast::ImplPhrase;
 use eval::Evaluator;
 use infer::{Env, TypeCtx, TypeError};
 use token::Tok;
-use types::{GlobalTables, TypDesc, TypId, TypLink};
+use types::{GlobalTables, TypeAbbrev, TypDesc, TypId, TypLink, NOTGENERIC};
 
 lalrpop_util::lalrpop_mod!(pub parser);
 
@@ -162,7 +162,7 @@ fn process_input(
                     Ok(_) => {}
                     Err(err) => eprintln!("evaluation error: {err}"),
                 },
-                Err(err) => report_type_error(&err),
+                Err(err) => report_type_error(input, &err),
             },
             ImplPhrase::LetDef(rec_flag, bindings) => {
                 match ctx.type_let_decl(&env, rec_flag, &bindings) {
@@ -200,14 +200,14 @@ fn process_input(
                                             "val {name} : {} = {value:?}",
                                             fmt_type(ctx.tables, ty)
                                         ),
-                                        Err(err) => report_type_error(&err),
+                                        Err(err) => report_type_error(input, &err),
                                     }
                                 }
                             }
                         }
                         *env = new_env;
                     }
-                    Err(err) => report_type_error(&err),
+                    Err(err) => report_type_error(input, &err),
                 }
             }
             ImplPhrase::TypeDef(decls) => match ctx.elaborate_type_decls(&decls) {
@@ -218,7 +218,7 @@ fn process_input(
                         }
                     }
                 }
-                Err(err) => report_type_error(&err),
+                Err(err) => report_type_error(input, &err),
             },
             ImplPhrase::ExcDef(decls) => match ctx.elaborate_exc_decls(&decls) {
                 Ok(()) => {
@@ -233,15 +233,37 @@ fn process_input(
                         }
                     }
                 }
-                Err(err) => report_type_error(&err),
+                Err(err) => report_type_error(input, &err),
             },
-            ImplPhrase::Directive(_) => {
-                eprintln!("(Directive processing is not supported yet)");
+            ImplPhrase::Directive(directive) => {
+                if directive.name == "show" {
+                    let path = directive.arg.trim();
+                    match ctx.lookup_module_type(path) {
+                        Some(id) => {
+                            let abbrev = ctx.tables.type_constrs.get(id).info.ty_abbr.clone();
+                            let ty = match abbrev {
+                                TypeAbbrev::Tabbrev(_, body) => body,
+                                TypeAbbrev::Tnotabbrev => ctx.tables.types.alloc(
+                                    TypDesc::Tconstr(id, Vec::new()),
+                                    NOTGENERIC,
+                                ),
+                            };
+                            println!(
+                                "{path} : {} (internal type id: {})",
+                                fmt_type(ctx.tables, ty),
+                                id.0
+                            );
+                        }
+                        None => eprintln!("show: unbound module type `{path}`"),
+                    }
+                } else {
+                    eprintln!("unknown directive `#{}`", directive.name);
+                }
             }
             ImplPhrase::Module(name, module) => match evaluator.eval_module(&module) {
                 Ok(value) => {
                     if let Err(err) = ctx.register_module(&name, &module, env) {
-                        report_type_error(&err);
+                        report_type_error(input, &err);
                     } else {
                         evaluator.install_module(name, value);
                     }
@@ -250,7 +272,7 @@ fn process_input(
             },
             ImplPhrase::ModuleType(name, sig) => {
                 if let Err(err) = ctx.register_module_type(&name, &sig) {
-                    report_type_error(&err);
+                    report_type_error(input, &err);
                 }
                 if repl_mode {
                     println!("module type {name} defined");
@@ -260,8 +282,50 @@ fn process_input(
     }
 }
 
-fn report_type_error(err: &TypeError) {
-    eprintln!("type error: {err:?}");
+fn report_type_error(input: &str, err: &TypeError) {
+    let location = match err {
+        TypeError::UnboundValue(_, loc)
+        | TypeError::UnboundConstr(_, loc)
+        | TypeError::UnboundLabel(_, loc)
+        | TypeError::UnboundTypeConstr(_, loc)
+        | TypeError::UnboundTypeVar(_, loc)
+        | TypeError::TypeArityErr { loc, .. }
+        | TypeError::NonLinearPattern(_, loc)
+        | TypeError::OrpatShouldBeClosed(loc)
+        | TypeError::PatWrongType(loc)
+        | TypeError::ExprWrongType(loc)
+        | TypeError::ApplicationOfNonFunction(loc)
+        | TypeError::IllShapedMatch(loc)
+        | TypeError::NotMutable(_, loc)
+        | TypeError::LabelMultiplyDefined(loc)
+        | TypeError::LabelUndefined(loc)
+        | TypeError::LabelNotBelong(loc)
+        | TypeError::LabelNotMutable(loc)
+        | TypeError::NonConstantConstr(loc)
+        | TypeError::ConstantConstr(loc)
+        | TypeError::RecursiveAbbrevErr(loc)
+        | TypeError::MalformedApp(loc)
+        | TypeError::BadFormatLetter(loc, _) => *loc,
+    };
+    let message = match err {
+        TypeError::ExprWrongType(_) => "expression has an incompatible type".to_owned(),
+        TypeError::UnboundValue(name, _) => format!("unbound value `{name}`"),
+        TypeError::UnboundConstr(name, _) => format!("unbound constructor `{name}`"),
+        TypeError::UnboundLabel(name, _) => format!("unbound label `{name}`"),
+        TypeError::UnboundTypeConstr(name, _) => format!("unbound type constructor `{name}`"),
+        other => format!("type error: {other:?}"),
+    };
+    let (line, column, source_line, line_start) = source_position(input, location.start);
+    eprintln!("type error at line {line}, column {column}: {message}");
+    if let Some(source_line) = source_line {
+        let width = location.end.saturating_sub(location.start).max(1);
+        eprintln!("  {line} | {source_line}");
+        eprintln!(
+            "    | {}{}",
+            " ".repeat(location.start.saturating_sub(line_start)),
+            "^".repeat(width.min(source_line.len().max(1)))
+        );
+    }
 }
 
 fn report_parse_error(input: &str, error: ParseError<usize, Tok, token::LexicalError>) {

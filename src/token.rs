@@ -87,6 +87,7 @@ pub enum Tok {
     Functor,
     Include,
     Val,
+    Show,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -372,6 +373,7 @@ fn raw_to_tok(raw: RawTok, text: &str, at: usize) -> Result<Tok, LexicalError> {
             "functor" => Tok::Functor,
             "include" => Tok::Include,
             "val" => Tok::Val,
+            "show" => Tok::Show,
             _ => Tok::Ident(value),
         },
         RawTok::Float(value) => Tok::Float(value),

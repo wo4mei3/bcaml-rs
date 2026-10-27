@@ -2138,6 +2138,23 @@ impl<'a> TypeCtx<'a> {
         Ok(())
     }
 
+    pub fn lookup_module_type(&self, path: &str) -> Option<TypeConstrId> {
+        let mut parts = path.split('.');
+        let module = self.module_sigs.get(parts.next()?)?;
+        let mut signature = module;
+        let type_name = parts.next()?;
+        for component in parts {
+            signature = match signature {
+                ModuleSig::Struct { modules, .. } => modules.get(component)?,
+                ModuleSig::Functor { .. } => return None,
+            };
+        }
+        match signature {
+            ModuleSig::Struct { types, .. } => types.get(type_name).copied(),
+            ModuleSig::Functor { .. } => None,
+        }
+    }
+
     fn type_signature(&mut self, sig: &SigExpr, env: &Env) -> Result<ModuleSig, TypeError> {
         match &sig.desc {
             SigDesc::Var(name) => self
@@ -2691,7 +2708,8 @@ impl<'a> TypeCtx<'a> {
                 }
             }
         }
-        self.substitute_module_signature(result, &replacements)
+        let instantiated = self.substitute_module_signature(result, &replacements);
+        self.generative_module_signature(instantiated)
     }
 
     fn substitute_module_signature(
@@ -2733,6 +2751,101 @@ impl<'a> TypeCtx<'a> {
             },
         }
     }
+
+    fn generative_module_signature(&mut self, signature: ModuleSig) -> ModuleSig {
+            let mut replacements = HashMap::new();
+            self.collect_generative_types(&signature, &mut replacements);
+            let signature = self.substitute_module_signature(&signature, &replacements);
+            self.remap_signature_type_ids(signature, &replacements)
+        }
+
+    fn collect_generative_types(
+            &mut self,
+            signature: &ModuleSig,
+            replacements: &mut HashMap<TypeConstrId, TypId>,
+        ) {
+            match signature {
+                ModuleSig::Struct { types, modules, .. } => {
+                    for id in types.values() {
+                        if matches!(
+                            self.tables.type_constrs.get(*id).info.ty_abbr,
+                            TypeAbbrev::Tnotabbrev
+                        ) {
+                            let fresh = self.tables.type_constrs.alloc(
+                                QualIdent {
+                                    qual: "functor".to_owned(),
+                                    id: self.tables.type_constrs.get(*id).qualid.id.clone(),
+                                },
+                                TypeInfo {
+                                    ty_abbr: TypeAbbrev::Tnotabbrev,
+                                    ty_arity: self.tables.type_constrs.get(*id).info.ty_arity,
+                                    ty_desc: TypeComponents::AbstractType,
+                                },
+                            );
+                            let fresh_ty = self.tables.types.alloc(
+                                TypDesc::Tconstr(fresh, Vec::new()),
+                                NOTGENERIC,
+                            );
+                            replacements.insert(*id, fresh_ty);
+                        }
+                    }
+                    for child in modules.values() {
+                        self.collect_generative_types(child, replacements);
+                    }
+                }
+                ModuleSig::Functor { argument, result, .. } => {
+                    self.collect_generative_types(argument, replacements);
+                    self.collect_generative_types(result, replacements);
+                }
+            }
+        }
+
+    fn remap_signature_type_ids(
+            &mut self,
+            signature: ModuleSig,
+            replacements: &HashMap<TypeConstrId, TypId>,
+        ) -> ModuleSig {
+            match signature {
+                ModuleSig::Struct {
+                    values,
+                    modules,
+                    types,
+                } => {
+                    let types = types
+                        .into_iter()
+                        .map(|(name, id)| {
+                            let id = replacements
+                                .get(&id)
+                                .and_then(|ty| match self.tables.types.get(*ty).desc {
+                                    TypDesc::Tconstr(id, _) => Some(id),
+                                    _ => None,
+                                })
+                                .unwrap_or(id);
+                            (name, id)
+                        })
+                        .collect();
+                    ModuleSig::Struct {
+                        values,
+                        modules: modules
+                            .into_iter()
+                            .map(|(name, child)| {
+                                (name, self.remap_signature_type_ids(child, replacements))
+                            })
+                            .collect(),
+                        types,
+                    }
+                }
+                ModuleSig::Functor {
+                    parameter,
+                    argument,
+                    result,
+                } => ModuleSig::Functor {
+                    parameter,
+                    argument: Box::new(self.remap_signature_type_ids(*argument, replacements)),
+                    result: Box::new(self.remap_signature_type_ids(*result, replacements)),
+                },
+            }
+        }
 
     fn substitute_type(
         &mut self,

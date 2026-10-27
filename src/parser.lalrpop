@@ -94,6 +94,7 @@ extern {
         "functor"   => Tok::Functor,
         "include"   => Tok::Include,
         "val"       => Tok::Val,
+        "show"      => Tok::Show,
     }
 }
 
@@ -218,6 +219,11 @@ ModApplyArg: ModExpr = {
         desc: ModDesc::Var(name),
         loc: Loc::default(),
     },
+    <l:@L> "struct" <items:ModItems> "end" <r:@R> =>
+        ModExpr {
+            desc: ModDesc::Struct(items),
+            loc: Loc::new(l, r),
+        },
 };
 
 ModItems: Vec<ModBinding> = {
@@ -946,5 +952,10 @@ TypeVarList: Vec<Ident> = {
 
 
 Directive: Directive = {
+    "show" <module:"ident"> "." <name:"ident"> =>
+        Directive {
+            name: "show".to_string(),
+            arg: format!("{module}.{name}"),
+        },
     <name:"ident"> <arg:"string"> => Directive { name, arg },
 };
