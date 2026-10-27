@@ -1,0 +1,55 @@
+module type SHOW = sig
+  type t;;
+  val show : t -> string;;
+end;;
+
+module type ORD = sig
+  type t;;
+  val compare : t -> t -> int;;
+end;;
+
+module IntShow : SHOW with type t = int = struct
+  type t = int;;
+  let show x = string_of_int x;; 
+end;;
+
+let () = printf "functor2 loaded\n";;
+
+module IntOrd : ORD with type t = int = struct
+  type t = int;;
+  let compare x y = x - y;;
+end;;
+
+module type PRINTABLE_ORDERED = sig
+  type t;;
+  val show : t -> string;;
+  val compare : t -> t -> int;;
+end;;
+
+module MakePrintableOrderd
+  (S : SHOW with type t = int)
+  (O : ORD with type t = int)
+  : PRINTABLE_ORDERED with type t = int
+= struct
+  type t = int;;
+  let show = S.show;;
+  let compare = O.compare;;
+end;;
+
+
+module MakePOFFunctor
+  (F:functor (S:SHOW with type t = int) ->
+     functor (O:ORD with type t = int) ->
+       PRINTABLE_ORDERED with type t = int)
+  (S1:SHOW with type t = int)
+  (O2:ORD with type t = int)
+  : PRINTABLE_ORDERED with type t = int
+  = F S1 O2;;
+
+module PrintableInt =
+  MakePOFFunctor MakePrintableOrderd IntShow IntOrd;;
+
+let () =
+  printf "%s %d\n"
+    (PrintableInt.show 42)
+    (PrintableInt.compare 10 3);;

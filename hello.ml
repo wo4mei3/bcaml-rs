@@ -1,0 +1,49 @@
+module Hello = struct
+    let message = "Hello,";;
+    let hello () = printf "%s" message;;
+end
+;;
+let () = Hello.hello ()
+;;
+module type Hello_Sig = sig
+      val hello: unit -> unit;;
+end
+;;
+module Hello2 : Hello_Sig = Hello
+;;
+module Hello3 : Hello_Sig = struct
+    let hello () = printf "%s" "Hello3!";;
+end
+;;
+module type AbstTypeSig = sig
+    type t;;
+    val get_t : int -> t;;
+    val print : t -> unit;;
+end
+;;
+module AbstTypeInt : AbstTypeSig = struct
+    type t = int;;
+    let get_t i = i;;
+    let print t = printf " world! %d\n" t;;
+end
+;;
+let t = AbstTypeInt.get_t 0;;
+let () = printf "%d" t;;
+let () = AbstTypeInt.print t
+;;
+
+#show AbstTypeInt.t;;
+
+module A = struct
+  let a = 1;;
+end;;
+
+module B = struct
+  module C = A;;
+end;;
+
+let x = B.C.a;;
+
+module F = functor (X: sig end) -> struct end;;
+module A = struct end;;
+module B = F(A);;
