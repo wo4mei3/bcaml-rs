@@ -1743,6 +1743,7 @@ fn resolve_constant_constr(tables: &GlobalTables, name: &str) -> Option<ConstrDe
 fn ref_name(r: &GlobalRef) -> &str {
     match r {
         GlobalRef::Name(n) => n,
+        GlobalRef::Symbol(_, n) => n,
         GlobalRef::Modname(q) => &q.id,
     }
 }
@@ -1758,7 +1759,8 @@ pub fn tpat(
         PatternDesc::Wild => Ok(new_env),
 
         PatternDesc::Var(v) => {
-            if let Some(cstr_id) = resolve_constant_constr(tables, v) {
+            let name = ref_name(v);
+            if let Some(cstr_id) = resolve_constant_constr(tables, name) {
                 let ty_res = {
                     let cs_res = tables.constrs.get(cstr_id).info.cs_res;
                     type_instance(&mut tables.types, cs_res)
@@ -1766,20 +1768,21 @@ pub fn tpat(
                 unify_pat(&mut tables.types, &tables.type_constrs, ty, ty_res, pat.loc)?;
                 return Ok(new_env);
             }
-            if env_lookup(&new_env, v).is_some() {
-                return Err(TypeError::NonLinearPattern(v.clone(), pat.loc));
+            if env_lookup(&new_env, name).is_some() {
+                return Err(TypeError::NonLinearPattern(name.to_string(), pat.loc));
             }
             let mut env = new_env;
-            env.push((v.clone(), (ty, mut_flag)));
+            env.push((name.to_string(), (ty, mut_flag)));
             Ok(env)
         }
 
         PatternDesc::Alias(p, v) => {
-            if env_lookup(&new_env, v).is_some() {
-                return Err(TypeError::NonLinearPattern(v.clone(), pat.loc));
+            let name = ref_name(v);
+            if env_lookup(&new_env, name).is_some() {
+                return Err(TypeError::NonLinearPattern(name.to_string(), pat.loc));
             }
             let mut env = new_env;
-            env.push((v.clone(), (ty, mut_flag)));
+            env.push((name.to_string(), (ty, mut_flag)));
             tpat(tables, env, p, ty, mut_flag)
         }
 
@@ -1830,7 +1833,7 @@ pub fn tpat(
 
         PatternDesc::App(head, args) => {
             if let (PatternDesc::Var(name), [single]) = (&head.desc, args.as_slice()) {
-                if let Some(cstr_id) = tables.constrs.find_by_name(name) {
+                if let Some(cstr_id) = tables.constrs.find_by_name(ref_name(name)) {
                     let info = &tables.constrs.get(cstr_id).info;
                     if info.cs_kind != ConstrKind::ConstrConstant {
                         let (cs_res, cs_arg, cs_mut) = (info.cs_res, info.cs_arg, info.cs_mut);
@@ -1912,9 +1915,9 @@ fn free_vars_of_pat(pat: &Pattern) -> Vec<String> {
 fn free_vars_of_pat_rec(pat: &Pattern, acc: &mut Vec<String>) {
     match &pat.desc {
         PatternDesc::Wild | PatternDesc::Constant(_) | PatternDesc::Construct0(_) => {}
-        PatternDesc::Var(v) => acc.push(v.clone()),
+        PatternDesc::Var(v) => acc.push(ref_name(v).to_string()),
         PatternDesc::Alias(p, v) => {
-            acc.push(v.clone());
+            acc.push(ref_name(v).to_string());
             free_vars_of_pat_rec(p, acc);
         }
         PatternDesc::Tuple(list) => list.iter().for_each(|p| free_vars_of_pat_rec(p, acc)),
@@ -2173,12 +2176,13 @@ impl<'a> TypeCtx<'a> {
                 ty_res
             }
 
-            ExprDesc::Assign(id, e) => {
+            ExprDesc::Assign(reference, e) => {
+                let id = ref_name(reference);
                 let (ty_schema, mut_flag) = env_lookup(env, id)
                     .cloned()
-                    .ok_or_else(|| TypeError::UnboundValue(id.clone(), expr.loc))?;
+                    .ok_or_else(|| TypeError::UnboundValue(id.to_string(), expr.loc))?;
                 if mut_flag == Mutability::Notmutable {
-                    return Err(TypeError::NotMutable(id.clone(), expr.loc));
+                    return Err(TypeError::NotMutable(id.to_string(), expr.loc));
                 }
                 let inst = type_instance(&mut self.tables.types, ty_schema);
                 self.type_expect(env, e, inst)?;
@@ -2284,7 +2288,10 @@ impl<'a> TypeCtx<'a> {
                 self.type_expect(env, start, self.builtins.ty_int)?;
                 self.type_expect(env, stop, self.builtins.ty_int)?;
                 let mut env2 = env.clone();
-                env2.push((var.clone(), (self.builtins.ty_int, Mutability::Notmutable)));
+                env2.push((
+                    ref_name(var).to_string(),
+                    (self.builtins.ty_int, Mutability::Notmutable),
+                ));
                 self.type_statement(&env2, body)?;
                 self.builtins.ty_unit
             }
@@ -2445,7 +2452,7 @@ impl<'a> TypeCtx<'a> {
             match &pat.desc {
                 PatternDesc::App(head, args) if !args.is_empty() => {
                     if let PatternDesc::Var(name) = &head.desc {
-                        if self.tables.constrs.find_by_name(name).is_none() {
+                        if self.tables.constrs.find_by_name(ref_name(name)).is_none() {
                             let var_pat = pat_constr_or_var(head.loc, name.clone());
                             let fn_expr = expr_of_function(pat.loc, args.clone(), expr.clone());
                             normalized.push((var_pat, fn_expr));
@@ -2652,7 +2659,7 @@ impl<'a> TypeCtx<'a> {
     }
 }
 
-fn pat_constr_or_var(loc: Loc, name: String) -> Pattern {
+fn pat_constr_or_var(loc: Loc, name: GlobalRef) -> Pattern {
     pat(loc, PatternDesc::Var(name))
 }
 

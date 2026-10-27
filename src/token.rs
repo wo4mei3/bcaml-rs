@@ -1,3 +1,4 @@
+use crate::symbol::NameTable;
 use logos::Logos;
 use std::fmt;
 
@@ -225,6 +226,10 @@ pub struct Lexer {
 
 impl Lexer {
     pub fn new(input: &str) -> Result<Self, LexicalError> {
+        Self::new_with_names(input, &mut NameTable::new())
+    }
+
+    pub fn new_with_names(input: &str, names: &mut NameTable) -> Result<Self, LexicalError> {
         let source = strip_comments(input)?;
         let mut raw = RawTok::lexer(&source).spanned();
         let mut tokens = Vec::new();
@@ -237,7 +242,12 @@ impl Lexer {
                     ch: source[span.clone()].chars().next().unwrap_or('\0'),
                 }),
             };
-            tokens.push(result.map(|tok| (span.start, tok, span.end)));
+            tokens.push(result.map(|tok| {
+                if let Tok::Ident(name) = &tok {
+                    names.intern(name);
+                }
+                (span.start, tok, span.end)
+            }));
         }
         Ok(Self {
             inner: tokens.into_iter(),

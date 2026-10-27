@@ -98,10 +98,12 @@ impl Evaluator {
                         normalized.push((
                             Pattern {
                                 loc: head.loc,
+                                symbol: head.symbol,
                                 desc: PatternDesc::Var(name.clone()),
                             },
                             Expr {
                                 loc: body.loc,
+                                symbol: body.symbol,
                                 desc: ExprDesc::Function(vec![(args.clone(), body.clone())]),
                             },
                         ));
@@ -119,7 +121,14 @@ impl Evaluator {
             }
         }
         for (pattern, body) in &normalized {
-            let value = eval_expr(body, next.clone())?;
+            // Non-recursive bindings are simultaneous: their right-hand
+            // sides see the enclosing scope, not earlier bindings.
+            let value_env = if rec_flag {
+                next.clone()
+            } else {
+                self.env.clone()
+            };
+            let value = eval_expr(body, value_env)?;
             let mut bindings = HashMap::new();
             if !match_pattern(pattern, &value, &mut bindings) {
                 return Err(EvalError::PatternMatch);
@@ -177,7 +186,7 @@ fn eval_expr(expr: &Expr, env: Store) -> Result<Value, EvalError> {
             Some(Box::new(eval_expr(arg, env)?)),
         )),
         ExprDesc::Apply(function, args) => {
-            if matches!(&function.desc, ExprDesc::Ident(GlobalRef::Name(name)) if name == "printf")
+            if matches!(&function.desc, ExprDesc::Ident(reference) if ref_name(reference) == "printf")
             {
                 let values = args
                     .iter()
@@ -191,17 +200,18 @@ fn eval_expr(expr: &Expr, env: Store) -> Result<Value, EvalError> {
             }
             Ok(value)
         }
-        ExprDesc::Assign(name, rhs) => {
+        ExprDesc::Assign(reference, rhs) => {
+            let name = ref_name(reference);
             let value = eval_expr(rhs, env.clone())?;
             let slot = env
                 .borrow()
                 .get(name)
                 .cloned()
-                .ok_or_else(|| EvalError::Unbound(name.clone()))?;
+                .ok_or_else(|| EvalError::Unbound(name.to_string()))?;
             match slot {
                 Value::Ref(cell) => *cell.borrow_mut() = value,
                 _ => {
-                    env.borrow_mut().insert(name.clone(), value);
+                    env.borrow_mut().insert(name.to_string(), value);
                 }
             }
             Ok(Value::Unit)
@@ -261,7 +271,8 @@ fn eval_expr(expr: &Expr, env: Store) -> Result<Value, EvalError> {
                 if (*up && i > b) || (!*up && i < b) {
                     break;
                 }
-                env.borrow_mut().insert(var.clone(), Value::Int(i));
+                env.borrow_mut()
+                    .insert(ref_name(var).to_string(), Value::Int(i));
                 eval_expr(body, env.clone())?;
                 if *up {
                     i += 1;
@@ -365,12 +376,12 @@ fn match_pattern(pattern: &Pattern, value: &Value, bindings: &mut HashMap<String
     match &pattern.desc {
         PatternDesc::Wild => true,
         PatternDesc::Var(name) => {
-            bindings.insert(name.clone(), value.clone());
+            bindings.insert(ref_name(name).to_string(), value.clone());
             true
         }
         PatternDesc::Alias(inner, name) => {
             if match_pattern(inner, value, bindings) {
-                bindings.insert(name.clone(), value.clone());
+                bindings.insert(ref_name(name).to_string(), value.clone());
                 true
             } else {
                 false
@@ -414,9 +425,9 @@ fn pattern_names(pattern: &Pattern) -> Vec<String> {
 
 fn collect_pattern_names(pattern: &Pattern, names: &mut Vec<String>) {
     match &pattern.desc {
-        PatternDesc::Var(name) => names.push(name.clone()),
+        PatternDesc::Var(name) => names.push(ref_name(name).to_string()),
         PatternDesc::Alias(inner, name) => {
-            names.push(name.clone());
+            names.push(ref_name(name).to_string());
             collect_pattern_names(inner, names);
         }
         PatternDesc::Tuple(items) => items.iter().for_each(|p| collect_pattern_names(p, names)),
@@ -451,6 +462,7 @@ fn bool_value(value: Value) -> Result<bool, EvalError> {
 fn ref_name(reference: &GlobalRef) -> &str {
     match reference {
         GlobalRef::Name(name) => name,
+        GlobalRef::Symbol(_, name) => name,
         GlobalRef::Modname(q) => &q.id,
     }
 }

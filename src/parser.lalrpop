@@ -202,7 +202,7 @@ ExprIfClosed: Expr = {
         let loc = Loc::new(l, r);
         expr(loc, ExprDesc::While(Box::new(c), Box::new(void(loc))))
     },
-    <l:@L> "for" <v:Ide> "=" <a:Expr> <up:Direction> <b:Expr> "do" <body:Expr> "done" <r:@R>
+    <l:@L> "for" <v:ValueIde> "=" <a:Expr> <up:Direction> <b:Expr> "do" <body:Expr> "done" <r:@R>
         => expr(Loc::new(l, r), ExprDesc::For {
                var: v,
                start: Box::new(a),
@@ -210,7 +210,7 @@ ExprIfClosed: Expr = {
                up,
                body: Box::new(body),
            }),
-    <l:@L> "for" <v:Ide> "=" <a:Expr> <up:Direction> <b:Expr> "do" "done" <r:@R> => {
+    <l:@L> "for" <v:ValueIde> "=" <a:Expr> <up:Direction> <b:Expr> "do" "done" <r:@R> => {
         let loc = Loc::new(l, r);
         expr(loc, ExprDesc::For { var: v, start: Box::new(a), stop: Box::new(b),
                                   up, body: Box::new(void(loc)) })
@@ -474,7 +474,7 @@ Binding<E>: Binding = {
 
 Pattern: Pattern = {
     <l:@L> <p:Pattern> "as" <i:"ident"> <r:@R>
-        => pat(Loc::new(l, r), PatternDesc::Alias(Box::new(p), i)),
+        => pat(Loc::new(l, r), PatternDesc::Alias(Box::new(p), GlobalRef::Name(i))),
     PatternOr,
 };
 
@@ -530,7 +530,7 @@ SimplePattern: Pattern = {
     <l:@L> "subtractive" <f:"float"> <r:@R>
         => pat(Loc::new(l, r), PatternDesc::Constant(AtomicConstant::Float(-f))),
     <l:@L> "_" <r:@R>       => pat(Loc::new(l, r), PatternDesc::Wild),
-    <l:@L> <i:Ide> <r:@R>   => pat_constr_or_var(Loc::new(l, r), i),
+    <l:@L> <i:Ide> <r:@R>   => pat_constr_or_var(Loc::new(l, r), GlobalRef::Name(i)),
     <l:@L> <q:QualIdent> <r:@R>
         => pat(Loc::new(l, r),
                PatternDesc::Construct0(find_constructor(GlobalRef::Modname(q)))),
@@ -581,6 +581,11 @@ PatternLabelNonEmpty: Vec<(GlobalRef, Pattern)> = {
 Ide: Ident = {
     <i:"ident">      => i,
     "prefix" <o:Infx> => o,
+};
+
+ValueIde: GlobalRef = {
+    <i:"ident">      => GlobalRef::Name(i),
+    "prefix" <o:Infx> => GlobalRef::Name(o),
 };
 
 Infx: String = {

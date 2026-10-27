@@ -3,6 +3,7 @@
 mod ast;
 mod eval;
 mod infer;
+pub mod symbol;
 pub mod token;
 mod types;
 
@@ -24,6 +25,8 @@ fn main() {
     let mut ctx = TypeCtx::new(&mut tables);
     let mut env: Env = Vec::new();
     let mut evaluator = Evaluator::new();
+    let mut names = symbol::NameTable::new();
+    let mut resolver = symbol::Resolver::new();
 
     if let Some(path) = source_path {
         let input = match std::fs::read_to_string(path) {
@@ -33,7 +36,15 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        process_input(&input, repl_mode, &mut ctx, &mut env, &mut evaluator);
+        process_input(
+            &input,
+            repl_mode,
+            &mut ctx,
+            &mut env,
+            &mut evaluator,
+            &mut names,
+            &mut resolver,
+        );
     } else {
         let stdin = io::stdin();
         let interactive = io::stdin().is_terminal();
@@ -53,7 +64,15 @@ fn main() {
             phrase.push_str(&line);
             phrase.push('\n');
             if phrase.contains(";;") {
-                process_input(&phrase, true, &mut ctx, &mut env, &mut evaluator);
+                process_input(
+                    &phrase,
+                    true,
+                    &mut ctx,
+                    &mut env,
+                    &mut evaluator,
+                    &mut names,
+                    &mut resolver,
+                );
                 phrase.clear();
                 if interactive {
                     print!("> ");
@@ -73,8 +92,10 @@ fn process_input(
     ctx: &mut TypeCtx<'_>,
     env: &mut Env,
     evaluator: &mut Evaluator,
+    names: &mut symbol::NameTable,
+    resolver: &mut symbol::Resolver,
 ) {
-    let lexer = match token::Lexer::new(input) {
+    let lexer = match token::Lexer::new_with_names(input, names) {
         Ok(lexer) => lexer,
         Err(error) => {
             eprintln!("lexical error: {error}");
@@ -89,7 +110,26 @@ fn process_input(
         }
     };
 
-    for phrase in phrases {
+    for mut phrase in phrases {
+        match &mut phrase {
+            ImplPhrase::Expr(e) => ast::resolve_expr(names, resolver, e),
+            ImplPhrase::LetDef(rec, bindings) => {
+                if *rec {
+                    for (p, _) in bindings.iter_mut() {
+                        ast::resolve_pattern(names, resolver, p);
+                    }
+                }
+                for (p, e) in bindings {
+                    if !*rec {
+                        ast::resolve_expr(names, resolver, e);
+                        ast::resolve_pattern(names, resolver, p);
+                    } else {
+                        ast::resolve_expr(names, resolver, e);
+                    }
+                }
+            }
+            _ => {}
+        }
         match phrase {
             ImplPhrase::Expr(e) => match ctx.type_expr(&env, &e) {
                 Ok(ty) => match evaluator.eval_expr(&e) {
@@ -127,7 +167,9 @@ fn process_input(
                                     matches!(&pattern.desc, ast::PatternDesc::Wild)
                                         || matches!(
                                             &pattern.desc,
-                                            ast::PatternDesc::Var(pattern_name) if pattern_name == "_"
+                                            ast::PatternDesc::Var(ast::GlobalRef::Name(pattern_name))
+                                                | ast::PatternDesc::Var(ast::GlobalRef::Symbol(_, pattern_name))
+                                                if pattern_name == "_"
                                         )
                                 }) {
                                     match ctx.type_expr(env, expression) {

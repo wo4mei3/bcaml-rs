@@ -1,4 +1,5 @@
 pub type Ident = String;
+use crate::symbol::{NameTable, Resolver, SymbolId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Loc {
@@ -21,6 +22,7 @@ pub struct QualIdent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GlobalRef {
     Name(String),
+    Symbol(SymbolId, String),
     Modname(QualIdent),
 }
 
@@ -47,6 +49,7 @@ pub enum Mutability {
 pub struct Expr {
     pub desc: ExprDesc,
     pub loc: Loc,
+    pub symbol: Option<SymbolId>,
 }
 
 pub type BoxExpr = Box<Expr>;
@@ -64,7 +67,7 @@ pub enum ExprDesc {
 
     Construct1(GlobalRef, BoxExpr),
 
-    Assign(Ident, BoxExpr),
+    Assign(GlobalRef, BoxExpr),
 
     RecordAccess(BoxExpr, GlobalRef),
 
@@ -79,7 +82,7 @@ pub enum ExprDesc {
 
     While(BoxExpr, BoxExpr),
     For {
-        var: Ident,
+        var: GlobalRef,
         start: BoxExpr,
         stop: BoxExpr,
         up: bool,
@@ -103,6 +106,7 @@ pub type MatchCase = (Vec<Pattern>, Expr);
 pub struct Pattern {
     pub desc: PatternDesc,
     pub loc: Loc,
+    pub symbol: Option<SymbolId>,
 }
 
 pub type BoxPattern = Box<Pattern>;
@@ -110,8 +114,8 @@ pub type BoxPattern = Box<Pattern>;
 #[derive(Clone, Debug)]
 pub enum PatternDesc {
     Wild,
-    Var(Ident),
-    Alias(BoxPattern, Ident),
+    Var(GlobalRef),
+    Alias(BoxPattern, GlobalRef),
     Constant(AtomicConstant),
     Tuple(Vec<Pattern>),
     Construct0(GlobalRef),
@@ -191,11 +195,173 @@ pub const CONSTR_NIL: &str = "[]";
 pub const CONSTR_VOID: &str = "()";
 
 pub fn expr(loc: Loc, desc: ExprDesc) -> Expr {
-    Expr { desc, loc }
+    Expr {
+        desc,
+        loc,
+        symbol: None,
+    }
 }
 
 pub fn pat(loc: Loc, desc: PatternDesc) -> Pattern {
-    Pattern { desc, loc }
+    Pattern {
+        desc,
+        loc,
+        symbol: None,
+    }
+}
+
+fn resolve_ref(table: &mut NameTable, resolver: &Resolver, reference: &mut GlobalRef) {
+    if let GlobalRef::Name(name) = reference {
+        let id = resolver.resolve(name).unwrap_or_else(|| table.intern(name));
+        *reference = GlobalRef::Symbol(id, name.clone());
+    }
+}
+
+fn resolve_binder(table: &mut NameTable, resolver: &mut Resolver, reference: &mut GlobalRef) {
+    if let GlobalRef::Name(name) = reference {
+        let id = resolver.declare(table, name);
+        *reference = GlobalRef::Symbol(id, name.clone());
+    }
+}
+
+pub fn resolve_pattern(table: &mut NameTable, resolver: &mut Resolver, pattern: &mut Pattern) {
+    match &mut pattern.desc {
+        PatternDesc::Var(reference) => {
+            resolve_binder(table, resolver, reference);
+            let id = match reference {
+                GlobalRef::Symbol(id, _) => *id,
+                _ => unreachable!(),
+            };
+            pattern.symbol = Some(id);
+        }
+        PatternDesc::Alias(inner, reference) => {
+            resolve_pattern(table, resolver, inner);
+            resolve_binder(table, resolver, reference);
+            if let GlobalRef::Symbol(id, _) = reference {
+                pattern.symbol = Some(*id);
+            }
+        }
+        PatternDesc::Tuple(items) => items
+            .iter_mut()
+            .for_each(|p| resolve_pattern(table, resolver, p)),
+        PatternDesc::Construct0(r) => resolve_ref(table, resolver, r),
+        PatternDesc::Construct1(r, p) => {
+            resolve_ref(table, resolver, r);
+            resolve_pattern(table, resolver, p);
+        }
+        PatternDesc::Or(a, b) => {
+            resolve_pattern(table, resolver, a);
+            resolve_pattern(table, resolver, b);
+        }
+        PatternDesc::Constraint(p, _) => resolve_pattern(table, resolver, p),
+        PatternDesc::Record(fields) => fields.iter_mut().for_each(|(r, p)| {
+            resolve_ref(table, resolver, r);
+            resolve_pattern(table, resolver, p);
+        }),
+        PatternDesc::App(head, args) => {
+            resolve_pattern(table, resolver, head);
+            args.iter_mut()
+                .for_each(|p| resolve_pattern(table, resolver, p));
+        }
+        PatternDesc::Wild | PatternDesc::Constant(_) => {}
+    }
+}
+
+pub fn resolve_expr(table: &mut NameTable, resolver: &mut Resolver, expr: &mut Expr) {
+    match &mut expr.desc {
+        ExprDesc::Ident(r) | ExprDesc::Construct0(r) => resolve_ref(table, resolver, r),
+        ExprDesc::Construct1(r, e) => {
+            resolve_ref(table, resolver, r);
+            resolve_expr(table, resolver, e);
+        }
+        ExprDesc::Assign(r, e) => {
+            resolve_ref(table, resolver, r);
+            resolve_expr(table, resolver, e);
+        }
+        ExprDesc::Tuple(es) | ExprDesc::Vector(es) => {
+            es.iter_mut().for_each(|e| resolve_expr(table, resolver, e))
+        }
+        ExprDesc::Apply(f, args) => {
+            resolve_expr(table, resolver, f);
+            args.iter_mut()
+                .for_each(|e| resolve_expr(table, resolver, e));
+        }
+        ExprDesc::Record(fields) => fields.iter_mut().for_each(|(r, e)| {
+            resolve_ref(table, resolver, r);
+            resolve_expr(table, resolver, e);
+        }),
+        ExprDesc::RecordAccess(e, r) => {
+            resolve_expr(table, resolver, e);
+            resolve_ref(table, resolver, r);
+        }
+        ExprDesc::RecordUpdate(e, r, v) => {
+            resolve_expr(table, resolver, e);
+            resolve_ref(table, resolver, r);
+            resolve_expr(table, resolver, v);
+        }
+        ExprDesc::Constraint(e, _) | ExprDesc::When(e, _) => resolve_expr(table, resolver, e),
+        ExprDesc::Condition(a, b, c) => {
+            resolve_expr(table, resolver, a);
+            resolve_expr(table, resolver, b);
+            resolve_expr(table, resolver, c);
+        }
+        ExprDesc::While(a, b) | ExprDesc::Sequence(a, b) => {
+            resolve_expr(table, resolver, a);
+            resolve_expr(table, resolver, b);
+        }
+        ExprDesc::For {
+            var,
+            start,
+            stop,
+            body,
+            ..
+        } => {
+            resolve_expr(table, resolver, start);
+            resolve_expr(table, resolver, stop);
+            resolver.push_scope();
+            resolve_binder(table, resolver, var);
+            resolve_expr(table, resolver, body);
+            resolver.pop_scope();
+        }
+        ExprDesc::Function(cases) => {
+            for (patterns, body) in cases {
+                resolver.push_scope();
+                patterns
+                    .iter_mut()
+                    .for_each(|p| resolve_pattern(table, resolver, p));
+                resolve_expr(table, resolver, body);
+                resolver.pop_scope();
+            }
+        }
+        ExprDesc::Let(rec, bindings, body) => {
+            resolver.push_scope();
+            if *rec {
+                for (p, _) in bindings.iter_mut() {
+                    resolve_pattern(table, resolver, p);
+                }
+            }
+            for (p, e) in bindings {
+                if !*rec {
+                    resolve_expr(table, resolver, e);
+                    resolve_pattern(table, resolver, p);
+                } else {
+                    resolve_expr(table, resolver, e);
+                }
+            }
+            resolve_expr(table, resolver, body);
+            resolver.pop_scope();
+        }
+        ExprDesc::TryWith(body, cases) => {
+            resolve_expr(table, resolver, body);
+            for (p, e) in cases {
+                resolver.push_scope();
+                resolve_pattern(table, resolver, p);
+                resolve_expr(table, resolver, e);
+                resolver.pop_scope();
+            }
+        }
+        ExprDesc::Constant(_) => {}
+    }
 }
 
 pub fn typ(loc: Loc, desc: TypeDesc) -> TypeExpr {
@@ -238,6 +404,81 @@ pub fn unary_minus(loc: Loc, op: &str, a: Expr) -> Expr {
         ("-", _) => unop(loc, "minus", a),
         ("-.", _) => unop(loc, "minus_float", a),
         _ => unop(loc, op, a),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolver_rewrites_references_to_symbols() {
+        let mut table = NameTable::new();
+        let mut resolver = Resolver::new();
+        let mut value = expr(Loc::default(), ExprDesc::Ident(GlobalRef::Name("x".into())));
+        resolve_expr(&mut table, &mut resolver, &mut value);
+        assert!(matches!(value.desc, ExprDesc::Ident(GlobalRef::Symbol(_, ref n)) if n == "x"));
+    }
+
+    #[test]
+    fn resolver_assigns_distinct_symbols_to_shadowed_binders() {
+        let mut table = NameTable::new();
+        let mut resolver = Resolver::new();
+        let mut value = expr(
+            Loc::default(),
+            ExprDesc::Let(
+                false,
+                vec![(
+                    pat(
+                        Loc::default(),
+                        PatternDesc::Var(GlobalRef::Name("x".into())),
+                    ),
+                    expr(
+                        Loc::default(),
+                        ExprDesc::Constant(StructConstant::Atom(AtomicConstant::Int(1))),
+                    ),
+                )],
+                Box::new(expr(
+                    Loc::default(),
+                    ExprDesc::For {
+                        var: GlobalRef::Name("x".into()),
+                        start: Box::new(expr(
+                            Loc::default(),
+                            ExprDesc::Constant(StructConstant::Atom(AtomicConstant::Int(0))),
+                        )),
+                        stop: Box::new(expr(
+                            Loc::default(),
+                            ExprDesc::Constant(StructConstant::Atom(AtomicConstant::Int(0))),
+                        )),
+                        up: true,
+                        body: Box::new(expr(
+                            Loc::default(),
+                            ExprDesc::Ident(GlobalRef::Name("x".into())),
+                        )),
+                    },
+                )),
+            ),
+        );
+        resolve_expr(&mut table, &mut resolver, &mut value);
+        let ExprDesc::Let(_, bindings, body) = value.desc else {
+            panic!("expected let");
+        };
+        let PatternDesc::Var(GlobalRef::Symbol(outer, _)) = bindings[0].0.desc else {
+            panic!("expected resolved outer binder");
+        };
+        let ExprDesc::For {
+            var: GlobalRef::Symbol(inner, _),
+            body,
+            ..
+        } = body.desc
+        else {
+            panic!("expected resolved for");
+        };
+        assert_ne!(outer, inner);
+        assert!(matches!(
+            body.desc,
+            ExprDesc::Ident(GlobalRef::Symbol(id, _)) if id == inner
+        ));
     }
 }
 
@@ -287,7 +528,7 @@ pub fn expr_constr_or_ident(loc: Loc, r: GlobalRef) -> Expr {
     expr(loc, ExprDesc::Ident(r))
 }
 
-pub fn pat_constr_or_var(loc: Loc, name: Ident) -> Pattern {
+pub fn pat_constr_or_var(loc: Loc, name: GlobalRef) -> Pattern {
     pat(loc, PatternDesc::Var(name))
 }
 
@@ -305,7 +546,9 @@ pub fn find_primitive(arity: i64, name: String) -> PrimDecl {
 
 pub fn make_assign(loc: Loc, lhs: Expr, rhs: Expr) -> Result<Expr, &'static str> {
     match lhs.desc {
-        ExprDesc::Ident(GlobalRef::Name(x)) => Ok(expr(loc, ExprDesc::Assign(x, Box::new(rhs)))),
+        ExprDesc::Ident(r @ GlobalRef::Name(_)) => {
+            Ok(expr(loc, ExprDesc::Assign(r, Box::new(rhs))))
+        }
         ExprDesc::RecordAccess(e, f) => Ok(expr(loc, ExprDesc::RecordUpdate(e, f, Box::new(rhs)))),
         ExprDesc::Apply(f, args) => {
             let name = match &f.desc {
