@@ -1,4 +1,5 @@
 pub type Ident = String;
+pub type Path = Vec<Ident>;
 use crate::symbol::{NameTable, Resolver, SymbolId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -180,6 +181,8 @@ pub enum ImplPhrase {
     TypeDef(Vec<TypeDecl>),
     ExcDef(Vec<ConstrDecl>),
     Directive(Directive),
+    Module(Ident, ModExpr),
+    ModuleType(Ident, SigExpr),
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +191,52 @@ pub enum IntfPhrase {
     TypeDecl(Vec<TypeDecl>),
     ExcDecl(Vec<ConstrDecl>),
     Directive(Directive),
+}
+
+#[derive(Clone, Debug)]
+pub struct SigExpr {
+    pub desc: SigDesc,
+    pub loc: Loc,
+}
+
+#[derive(Clone, Debug)]
+pub enum SigDesc {
+    Var(Ident),
+    Struct(Vec<SigItem>),
+    Functor(Ident, Box<SigExpr>, Box<SigExpr>),
+    WithType(Box<SigExpr>, Ident, TypeExpr),
+}
+
+#[derive(Clone, Debug)]
+pub enum SigItem {
+    Value(Ident, TypeExpr),
+    Type(Vec<TypeDecl>),
+    Module(Ident, SigExpr),
+}
+
+#[derive(Clone, Debug)]
+pub struct ModExpr {
+    pub desc: ModDesc,
+    pub loc: Loc,
+}
+
+#[derive(Clone, Debug)]
+pub enum ModDesc {
+    Var(Ident),
+    Access(Box<ModExpr>, Ident),
+    Struct(Vec<ModBinding>),
+    Functor(Ident, Box<SigExpr>, Box<ModExpr>),
+    Apply(Box<ModExpr>, Vec<ModExpr>),
+    Seal(Box<ModExpr>, Box<SigExpr>),
+}
+
+#[derive(Clone, Debug)]
+pub enum ModBinding {
+    Expr(Expr),
+    Let(bool, Vec<Binding>),
+    Type(Vec<TypeDecl>),
+    Module(Ident, ModExpr),
+    ModuleType(Ident, SigExpr),
 }
 
 pub const CONSTR_CONS: &str = "::";

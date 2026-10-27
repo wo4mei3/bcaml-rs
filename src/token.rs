@@ -81,6 +81,12 @@ pub enum Tok {
     When,
     While,
     With,
+    Module,
+    Sig,
+    Struct,
+    Functor,
+    Include,
+    Val,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -360,6 +366,12 @@ fn raw_to_tok(raw: RawTok, text: &str, at: usize) -> Result<Tok, LexicalError> {
             "when" => Tok::When,
             "while" => Tok::While,
             "with" => Tok::With,
+            "module" => Tok::Module,
+            "sig" => Tok::Sig,
+            "struct" => Tok::Struct,
+            "functor" => Tok::Functor,
+            "include" => Tok::Include,
+            "val" => Tok::Val,
             _ => Tok::Ident(value),
         },
         RawTok::Float(value) => Tok::Float(value),

@@ -101,12 +101,30 @@ impl TypeConstrArena {
         self.by_name.get(name).copied()
     }
 
+    pub fn find_by_qual_name(&self, qual: &str, name: &str) -> Option<TypeConstrId> {
+        self.entries
+            .iter()
+            .find(|entry| entry.qualid.qual == qual && entry.qualid.id == name)
+            .map(|entry| {
+                let index = self
+                    .entries
+                    .iter()
+                    .position(|candidate| candidate.qualid == entry.qualid)
+                    .expect("type constructor entry must exist");
+                TypeConstrId(index as u32)
+            })
+    }
+
     pub fn get(&self, id: TypeConstrId) -> &Global<TypeInfo> {
         &self.entries[id.0 as usize]
     }
 
     pub fn get_mut(&mut self, id: TypeConstrId) -> &mut Global<TypeInfo> {
         &mut self.entries[id.0 as usize]
+    }
+
+    pub fn replace(&mut self, id: TypeConstrId, info: TypeInfo) -> TypeInfo {
+        std::mem::replace(&mut self.entries[id.0 as usize].info, info)
     }
 
     pub fn same_type_constr(&self, a: TypeConstrId, b: TypeConstrId) -> bool {

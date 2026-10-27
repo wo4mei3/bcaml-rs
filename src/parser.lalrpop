@@ -88,6 +88,12 @@ extern {
         "when"      => Tok::When,
         "while"     => Tok::While,
         "with"      => Tok::With,
+        "module"    => Tok::Module,
+        "sig"       => Tok::Sig,
+        "struct"    => Tok::Struct,
+        "functor"   => Tok::Functor,
+        "include"   => Tok::Include,
+        "val"       => Tok::Val,
     }
 }
 
@@ -110,6 +116,167 @@ ImplementationPhrase: ImplPhrase = {
     "type" <d:TypeDeclList> ";;"       => ImplPhrase::TypeDef(d),
     "exception" <d:ExcDecl> ";;"       => ImplPhrase::ExcDef(d),
     "#" <d:Directive> ";;"             => ImplPhrase::Directive(d),
+    "module" <name:"ident"> "=" <m:ModExpr> ";;"
+        => ImplPhrase::Module(name, m),
+    "module" <name:"ident"> ":" <sig:SigExpr> "=" <m:ModExpr> ";;"
+        => ImplPhrase::Module(name, ModExpr {
+            loc: m.loc,
+            desc: ModDesc::Seal(Box::new(m), Box::new(sig)),
+        }),
+    "module" <name:"ident"> <params:ModParamList> ":" <sig:SigExpr> "=" <m:ModExpr> ";;" => {
+        let sealed = ModExpr {
+            loc: m.loc,
+            desc: ModDesc::Seal(Box::new(m), Box::new(sig)),
+        };
+        let mut body = sealed;
+        for (param, param_sig) in params.into_iter().rev() {
+            let loc = body.loc;
+            body = ModExpr {
+                desc: ModDesc::Functor(param, Box::new(param_sig), Box::new(body)),
+                loc,
+            };
+        }
+        ImplPhrase::Module(name, body)
+    },
+    "module" <name:"ident"> <params:ModParamList> "=" <m:ModExpr> ";;" => {
+        let mut body = m;
+        for (param, sig) in params.into_iter().rev() {
+            let loc = body.loc;
+            body = ModExpr {
+                desc: ModDesc::Functor(param, Box::new(sig), Box::new(body)),
+                loc,
+            };
+        }
+        ImplPhrase::Module(name, body)
+    },
+    "module" "type" <name:"ident"> "=" <s:SigExpr> ";;"
+        => ImplPhrase::ModuleType(name, s),
+};
+
+ModParamList: Vec<(Ident, SigExpr)> = {
+    <first:ModParam> <mut rest:ModParamList> => { rest.insert(0, first); rest },
+    <first:ModParam> => vec![first],
+};
+
+ModParam: (Ident, SigExpr) = {
+    "(" <name:"ident"> ":" <sig:SigExpr> ")" => (name, sig),
+};
+
+ModExpr: ModExpr = {
+    <l:@L> <name:"ident"> <args:ModApplyArgs> <r:@R> => {
+        let head = ModExpr {
+            desc: ModDesc::Var(name),
+            loc: Loc::new(l, r),
+        };
+        args.into_iter().fold(head, |function, argument| {
+            let loc = function.loc;
+            match function.desc {
+                ModDesc::Apply(inner, mut previous) => {
+                    previous.push(argument);
+                    ModExpr {
+                        desc: ModDesc::Apply(inner, previous),
+                        loc,
+                    }
+                }
+                _ => ModExpr {
+                    desc: ModDesc::Apply(Box::new(function), vec![argument]),
+                    loc,
+                },
+            }
+        })
+    },
+    ModAtom,
+};
+
+ModAtom: ModExpr = {
+    <l:@L> <functor:"ident"> "(" <arg:ModExpr> ")" <r:@R> =>
+        ModExpr {
+            desc: ModDesc::Apply(
+                Box::new(ModExpr {
+                    desc: ModDesc::Var(functor),
+                    loc: Loc::new(l, r),
+                }),
+                vec![arg],
+            ),
+            loc: Loc::new(l, r),
+        },
+    <l:@L> "struct" <items:ModItems> "end" <r:@R> =>
+        ModExpr { desc: ModDesc::Struct(items), loc: Loc::new(l, r) },
+    <l:@L> "functor" "(" <param:"ident"> ":" <sig:SigExpr> ")" "->" <body:ModExpr> <r:@R> =>
+        ModExpr { desc: ModDesc::Functor(param, Box::new(sig), Box::new(body)), loc: Loc::new(l, r) },
+    <l:@L> "(" <m:ModExpr> ")" <r:@R> =>
+        ModExpr { desc: m.desc, loc: Loc::new(l, r) },
+};
+
+ModApplyArgs: Vec<ModExpr> = {
+    <arg:ModApplyArg> <mut rest:ModApplyArgs> => { rest.insert(0, arg); rest },
+    => vec![],
+};
+
+ModApplyArg: ModExpr = {
+    <name:"ident"> => ModExpr {
+        desc: ModDesc::Var(name),
+        loc: Loc::default(),
+    },
+};
+
+ModItems: Vec<ModBinding> = {
+    <item:ModItem> <mut rest:ModItems> => { rest.insert(0, item); rest },
+    => vec![],
+};
+
+ModItem: ModBinding = {
+    "let" <rec:"rec"? > <b:LetBindings> ";;" =>
+        ModBinding::Let(rec.is_some(), b),
+    "type" <d:TypeDeclList> ";;" => ModBinding::Type(d),
+    "module" "type" <name:"ident"> "=" <s:SigExpr> ";;" =>
+        ModBinding::ModuleType(name, s),
+    "module" <name:"ident"> "=" <m:ModExpr> ";;" =>
+        ModBinding::Module(name, m),
+};
+
+SigExpr: SigExpr = {
+    <l:@L> "sig" <items:SigItems> "end" "with" "type" <tyname:"ident"> "=" <ty:Type> <r:@R> =>
+        SigExpr {
+            desc: SigDesc::WithType(
+                Box::new(SigExpr {
+                    desc: SigDesc::Struct(items),
+                    loc: Loc::new(l, r),
+                }),
+                tyname,
+                ty,
+            ),
+            loc: Loc::new(l, r),
+        },
+    <l:@L> <name:"ident"> "with" "type" <tyname:"ident"> "=" <ty:Type> <r:@R> =>
+        SigExpr {
+            desc: SigDesc::WithType(
+                Box::new(SigExpr {
+                    desc: SigDesc::Var(name),
+                    loc: Loc::new(l, r),
+                }),
+                tyname,
+                ty,
+            ),
+            loc: Loc::new(l, r),
+        },
+    <l:@L> "sig" <items:SigItems> "end" <r:@R> =>
+        SigExpr { desc: SigDesc::Struct(items), loc: Loc::new(l, r) },
+    <l:@L> "functor" "(" <param:"ident"> ":" <arg:SigExpr> ")" "->" <ret:SigExpr> <r:@R> =>
+        SigExpr { desc: SigDesc::Functor(param, Box::new(arg), Box::new(ret)), loc: Loc::new(l, r) },
+    <l:@L> <name:"ident"> <r:@R> =>
+        SigExpr { desc: SigDesc::Var(name), loc: Loc::new(l, r) },
+};
+
+SigItems: Vec<SigItem> = {
+    <item:SigItem> <mut rest:SigItems> => { rest.insert(0, item); rest },
+    => vec![],
+};
+
+SigItem: SigItem = {
+    "val" <name:"ident"> ":" <ty:Type> ";;"? => SigItem::Value(name, ty),
+    "type" <d:TypeDeclList> ";;"? => SigItem::Type(d),
+    "module" <name:"ident"> ":" <s:SigExpr> ";;"? => SigItem::Module(name, s),
 };
 
 pub Interface: Option<IntfPhrase> = {
@@ -624,6 +791,11 @@ ExtIdent: GlobalRef = {
 Type: TypeExpr = {
     <l:@L> <a:TypeTuple> "->" <b:Type> <r:@R>
         => typ(Loc::new(l, r), TypeDesc::Arrow(Box::new(a), Box::new(b))),
+    <l:@L> <q:"ident"> "." <i:"ident"> <r:@R> =>
+        typ(
+            Loc::new(l, r),
+            TypeDesc::Constr(GlobalRef::Modname(QualIdent { qual: q, id: i }), vec![]),
+        ),
     TypeTuple,
 };
 
@@ -702,9 +874,47 @@ Type1Decl: TypeDecl = {
 
 Type1Def: TypeDef = {
     =>                                       TypeDef::Abstract,
-    "=" OptBar <c:ConstrDecl>             => TypeDef::Variant(c),
+    "=" <element:"ident"> <constructor:"ident"> => {
+        let element = typ(
+            Loc::default(),
+            TypeDesc::Constr(GlobalRef::Name(element), vec![]),
+        );
+        TypeDef::Abbrev(typ(
+            Loc::default(),
+            TypeDesc::Constr(GlobalRef::Name(constructor), vec![element]),
+        ))
+    },
+    "=" <name:Ide> "of" <m:MutableOption> <t:Type> =>
+        TypeDef::Variant(vec![ConstrDecl::Constr1(name, t, m)]),
+    "=" <first:Constr1Decl> "|" <mut rest:ConstrDecl> => {
+        rest.insert(0, first);
+        TypeDef::Variant(rest)
+    },
+    "=" <name:"ident"> => {
+        if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+            TypeDef::Variant(vec![ConstrDecl::Constr0(name)])
+        } else {
+            TypeDef::Abbrev(typ(
+                Loc::default(),
+                TypeDesc::Constr(GlobalRef::Name(name), vec![]),
+            ))
+        }
+    },
+    "=" <t:QualifiedType>                  => TypeDef::Abbrev(t),
+    "=" "|" <c:ConstrDecl>               => TypeDef::Variant(c),
     "=" "{" <l:LabelDeclList> "}"         => TypeDef::Record(l),
     "==" <t:Type>                         => TypeDef::Abbrev(t),
+};
+
+QualifiedType: TypeExpr = {
+    <l:@L> <q:"ident"> "." <i:"ident"> <r:@R> =>
+        typ(
+            Loc::new(l, r),
+            TypeDesc::Constr(
+                GlobalRef::Modname(QualIdent { qual: q, id: i }),
+                vec![],
+            ),
+        ),
 };
 
 Constr1Decl: ConstrDecl = {

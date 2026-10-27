@@ -24,7 +24,16 @@ pub enum Value {
     Closure(Rc<Closure>),
     Primitive(String),
     Partial(String, Vec<Value>),
+    ModuleFunctor(Rc<ModuleClosure>),
     Uninitialized,
+}
+
+fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering, EvalError> {
+    match (a, b) {
+        (Value::Int(a), Value::Int(b)) => Ok(a.cmp(b)),
+        (Value::String(a), Value::String(b)) => Ok(a.borrow().cmp(&b.borrow())),
+        _ => Err(EvalError::Runtime("values are not comparable".into())),
+    }
 }
 
 pub struct Closure {
@@ -34,6 +43,12 @@ pub struct Closure {
 struct Case {
     patterns: Vec<Pattern>,
     body: Expr,
+    env: Store,
+}
+
+struct ModuleClosure {
+    parameter: String,
+    body: ModExpr,
     env: Store,
 }
 
@@ -77,6 +92,14 @@ impl Evaluator {
 
     pub fn eval_expr(&mut self, expr: &Expr) -> Result<Value, EvalError> {
         eval_expr(expr, self.env.clone())
+    }
+
+    pub fn eval_module(&mut self, module: &ModExpr) -> Result<Value, EvalError> {
+        eval_module(module, self.env.clone())
+    }
+
+    pub fn install_module(&mut self, name: String, value: Value) {
+        self.env.borrow_mut().insert(name, value);
     }
 
     pub fn eval_let(
@@ -336,6 +359,7 @@ fn apply(function: Value, argument: Value) -> Result<Value, EvalError> {
                     if case.patterns.len() == 1 {
                         return eval_expr(&case.body, local);
                     }
+
                     return Ok(Value::Closure(Rc::new(Closure {
                         cases: vec![Case {
                             patterns: case.patterns[1..].to_vec(),
@@ -352,7 +376,79 @@ fn apply(function: Value, argument: Value) -> Result<Value, EvalError> {
             args.push(argument);
             primitive_apply(&name, args)
         }
+        Value::ModuleFunctor(_) => Err(EvalError::Runtime(
+            "module functors cannot be applied as values".into(),
+        )),
         _ => Err(EvalError::InvalidApplication),
+    }
+}
+
+fn eval_module(module: &ModExpr, env: Store) -> Result<Value, EvalError> {
+    match &module.desc {
+        ModDesc::Var(name) => env
+            .borrow()
+            .get(name)
+            .cloned()
+            .ok_or_else(|| EvalError::Unbound(name.clone())),
+        ModDesc::Access(parent, name) => match eval_module(parent, env)? {
+            Value::Record(fields) => fields
+                .get(name)
+                .cloned()
+                .ok_or_else(|| EvalError::Unbound(name.clone())),
+            _ => Err(EvalError::Runtime("module access on non-module".into())),
+        },
+        ModDesc::Struct(items) => {
+            let local = Rc::new(RefCell::new(env.borrow().clone()));
+            let mut evaluator = Evaluator { env: local.clone() };
+            for item in items {
+                match item {
+                    ModBinding::Expr(expr) => {
+                        evaluator.eval_expr(expr)?;
+                    }
+                    ModBinding::Let(rec_flag, bindings) => {
+                        evaluator.eval_let(*rec_flag, bindings)?;
+                    }
+                    ModBinding::Module(name, child) => {
+                        let value = eval_module(child, evaluator.env.clone())?;
+                        evaluator.env.borrow_mut().insert(name.clone(), value);
+                    }
+                    ModBinding::ModuleType(_, _) | ModBinding::Type(_) => {}
+                }
+            }
+            let mut fields = HashMap::new();
+            for (name, value) in evaluator.env.borrow().iter() {
+                if !env.borrow().contains_key(name) {
+                    fields.insert(name.clone(), value.clone());
+                }
+            }
+            Ok(Value::Record(fields))
+        }
+        ModDesc::Functor(parameter, _, body) => Ok(Value::ModuleFunctor(Rc::new(
+            ModuleClosure {
+                parameter: parameter.clone(),
+                body: (**body).clone(),
+                env,
+            },
+        ))),
+        ModDesc::Apply(function, args) => {
+            let mut value = eval_module(function, env.clone())?;
+            for arg in args {
+                value = apply_module(value, eval_module(arg, env.clone())?)?;
+            }
+            Ok(value)
+        }
+        ModDesc::Seal(inner, _) => eval_module(inner, env),
+    }
+}
+
+fn apply_module(function: Value, argument: Value) -> Result<Value, EvalError> {
+    match function {
+        Value::ModuleFunctor(closure) => {
+            let local = Rc::new(RefCell::new(closure.env.borrow().clone()));
+            local.borrow_mut().insert(closure.parameter.clone(), argument);
+            eval_module(&closure.body, local)
+        }
+        _ => Err(EvalError::Runtime("application of non-functor module".into())),
     }
 }
 
@@ -395,6 +491,9 @@ fn match_pattern(pattern: &Pattern, value: &Value, bindings: &mut HashMap<String
             _ => false,
         },
         PatternDesc::Tuple(patterns) => {
+            if patterns.is_empty() {
+                return matches!(value, Value::Unit);
+            }
             matches!(value, Value::Tuple(values) if patterns.len() == values.len() && patterns.iter().zip(values).all(|(p, v)| match_pattern(p, v, bindings)))
         }
         PatternDesc::Construct0(name) => {
@@ -470,12 +569,32 @@ fn ref_name(reference: &GlobalRef) -> &str {
 fn primitive_apply(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
     if name == "printf" {
         if args.len() < 2 {
+            if let Some(Value::String(format)) = args.first() {
+                if !printf_needs_argument(&format.borrow()) {
+                    print!("{}", format.borrow());
+                    return Ok(Value::Unit);
+                }
+            }
             return Ok(Value::Partial(name.to_string(), args));
         }
         let format = string_value(args[0].clone())?;
         let output = format_printf(&format, &args[1..])?;
         print!("{output}");
         return Ok(Value::Unit);
+    }
+
+    fn printf_needs_argument(format: &str) -> bool {
+        let mut chars = format.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                match chars.next() {
+                    Some('%') => {}
+                    Some(_) => return true,
+                    None => return true,
+                }
+            }
+        }
+        false
     }
 
     let binary = |args: &[Value]| {
@@ -492,10 +611,10 @@ fn primitive_apply(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             "mod" => Value::Int(int(a.clone())? % int(b.clone())?),
             "=" | "==" => Value::Bool(display_value(a) == display_value(b)),
             "<>" | "!=" => Value::Bool(display_value(a) != display_value(b)),
-            "<" => Value::Bool(int(a.clone())? < int(b.clone())?),
-            "<=" => Value::Bool(int(a.clone())? <= int(b.clone())?),
-            ">" => Value::Bool(int(a.clone())? > int(b.clone())?),
-            ">=" => Value::Bool(int(a.clone())? >= int(b.clone())?),
+            "<" => Value::Bool(compare_values(a, b)? == std::cmp::Ordering::Less),
+            "<=" => Value::Bool(compare_values(a, b)? != std::cmp::Ordering::Greater),
+            ">" => Value::Bool(compare_values(a, b)? == std::cmp::Ordering::Greater),
+            ">=" => Value::Bool(compare_values(a, b)? != std::cmp::Ordering::Less),
             "^" => Value::String(Rc::new(RefCell::new(
                 string_value(a.clone())? + &string_value(b.clone())?,
             ))),
@@ -712,7 +831,10 @@ fn display_value(value: &Value) -> String {
         Value::Constructed(name, Some(v)) => format!("({name} {})", display_value(v)),
         Value::Constructor(name) => format!("<constructor {name}>"),
         Value::Ref(_) => "<ref>".into(),
-        Value::Closure(_) | Value::Primitive(_) | Value::Partial(_, _) => "<fun>".into(),
+        Value::Closure(_)
+        | Value::Primitive(_)
+        | Value::Partial(_, _)
+        | Value::ModuleFunctor(_) => "<fun>".into(),
         Value::Uninitialized => "<uninitialized>".into(),
     }
 }

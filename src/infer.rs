@@ -1707,6 +1707,20 @@ pub fn type_vect(builtins: &Builtins, arena: &mut TypeArena, ty_arg: TypId) -> T
 
 pub type Env = Vec<(String, (TypId, Mutability))>;
 
+#[derive(Clone, Debug)]
+pub enum ModuleSig {
+    Struct {
+        values: HashMap<String, TypId>,
+        modules: HashMap<String, ModuleSig>,
+        types: HashMap<String, TypeConstrId>,
+    },
+    Functor {
+        parameter: String,
+        argument: Box<ModuleSig>,
+        result: Box<ModuleSig>,
+    },
+}
+
 fn env_lookup<'a>(env: &'a Env, name: &str) -> Option<&'a (TypId, Mutability)> {
     env.iter().find(|(n, _)| n == name).map(|(_, v)| v)
 }
@@ -1745,6 +1759,19 @@ fn ref_name(r: &GlobalRef) -> &str {
         GlobalRef::Name(n) => n,
         GlobalRef::Symbol(_, n) => n,
         GlobalRef::Modname(q) => &q.id,
+    }
+}
+
+fn module_path(expr: &Expr) -> Option<String> {
+    match &expr.desc {
+        ExprDesc::Ident(reference) => Some(ref_name(reference).to_owned()),
+        ExprDesc::RecordAccess(parent, reference) => {
+            let mut path = module_path(parent)?;
+            path.push('.');
+            path.push_str(ref_name(reference));
+            Some(path)
+        }
+        _ => None,
     }
 }
 
@@ -1990,6 +2017,12 @@ pub(crate) fn type_of_rec(
             let decl_id = tables
                 .type_constrs
                 .find_by_name(name)
+                .or_else(|| match r {
+                    GlobalRef::Modname(path) => {
+                        tables.type_constrs.find_by_qual_name(&path.qual, &path.id)
+                    }
+                    _ => None,
+                })
                 .ok_or_else(|| TypeError::UnboundTypeConstr(name.to_string(), texpr.loc))?;
             let ty_arity = tables.type_constrs.get(decl_id).info.ty_arity;
             if args.len() as i32 != ty_arity {
@@ -2070,6 +2103,9 @@ pub struct TypeCtx<'a> {
     pub tables: &'a mut GlobalTables,
     pub infer: Infer,
     pub builtins: Builtins,
+    module_fields: HashMap<String, HashMap<String, TypId>>,
+    pub module_sigs: HashMap<String, ModuleSig>,
+    signature_defs: HashMap<String, SigExpr>,
 }
 
 impl<'a> TypeCtx<'a> {
@@ -2080,6 +2116,216 @@ impl<'a> TypeCtx<'a> {
             tables,
             infer: Infer::new(),
             builtins,
+            module_fields: HashMap::new(),
+            module_sigs: HashMap::new(),
+            signature_defs: HashMap::new(),
+        }
+    }
+
+    pub fn register_module(
+        &mut self,
+        name: &str,
+        module: &ModExpr,
+        outer: &Env,
+    ) -> Result<(), TypeError> {
+        let signature = self.type_module_expr(module, outer)?;
+        self.module_sigs.insert(name.to_owned(), signature);
+        Ok(())
+    }
+
+    pub fn register_module_type(&mut self, name: &str, sig: &SigExpr) -> Result<(), TypeError> {
+        self.signature_defs.insert(name.to_owned(), sig.clone());
+        Ok(())
+    }
+
+    fn type_signature(&mut self, sig: &SigExpr, env: &Env) -> Result<ModuleSig, TypeError> {
+        match &sig.desc {
+            SigDesc::Var(name) => self
+                .signature_defs
+                .get(name)
+                .cloned()
+                .ok_or_else(|| TypeError::UnboundValue(name.clone(), sig.loc))
+                .and_then(|resolved| self.type_signature(&resolved, env)),
+            SigDesc::Struct(items) => {
+                let mut values = HashMap::new();
+                let mut modules = HashMap::new();
+                let mut types = HashMap::new();
+                for item in items {
+                    match item {
+                        SigItem::Value(name, ty) => {
+                            let ty = type_of_type_expression(self.tables, false, ty)?;
+                            values.insert(name.clone(), ty);
+                        }
+                        SigItem::Type(decls) => {
+                            self.elaborate_type_decls(decls)?;
+                            for (name, _, _) in decls {
+                                if let Some(id) = self.tables.type_constrs.find_by_name(name) {
+                                    types.insert(name.clone(), id);
+                                }
+                            }
+                        }
+                        SigItem::Module(name, child) => {
+                            modules.insert(name.clone(), self.type_signature(child, env)?);
+                        }
+                    }
+                }
+                Ok(ModuleSig::Struct {
+                    values,
+                    modules,
+                    types,
+                })
+            }
+            SigDesc::Functor(parameter, argument, result) => Ok(ModuleSig::Functor {
+                parameter: parameter.clone(),
+                argument: Box::new(self.type_signature(argument, env)?),
+                result: Box::new(self.type_signature(result, env)?),
+            }),
+            SigDesc::WithType(base, name, ty) => {
+                let signature = self.type_signature(base, env)?;
+                let replacement = type_of_type_expression(self.tables, false, ty)?;
+                let type_id = match &signature {
+                    ModuleSig::Struct { types, .. } => types.get(name).copied(),
+                    _ => None,
+                }
+                .ok_or_else(|| TypeError::UnboundTypeConstr(name.clone(), sig.loc))?;
+                let mut replacements = HashMap::new();
+                replacements.insert(type_id, replacement);
+                Ok(self.substitute_module_signature(&signature, &replacements))
+            }
+        }
+    }
+
+    fn type_module_expr(&mut self, module: &ModExpr, env: &Env) -> Result<ModuleSig, TypeError> {
+        match &module.desc {
+            ModDesc::Var(name) => self
+                .module_sigs
+                .get(name)
+                .cloned()
+                .ok_or_else(|| TypeError::UnboundValue(name.clone(), module.loc)),
+            ModDesc::Access(parent, name) => match self.type_module_expr(parent, env)? {
+                ModuleSig::Struct { modules, .. } => modules
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| TypeError::UnboundValue(name.clone(), module.loc)),
+                ModuleSig::Functor { .. } => Err(TypeError::ApplicationOfNonFunction(module.loc)),
+            },
+            ModDesc::Struct(items) => {
+                let mut local_env = env.clone();
+                let mut values = HashMap::new();
+                let mut modules = HashMap::new();
+                let mut types = HashMap::new();
+                for item in items {
+                    match item {
+                        ModBinding::Let(rec_flag, bindings) => {
+                            let next = self.type_let_decl(&local_env, *rec_flag, bindings)?;
+                            for (name, (ty, _)) in
+                                next.iter().take(next.len().saturating_sub(local_env.len()))
+                            {
+                                values.insert(name.clone(), *ty);
+                            }
+                            local_env = next;
+                        }
+                        ModBinding::Type(decls) => {
+                            self.elaborate_type_decls(decls)?;
+                            for (name, _, _) in decls {
+                                if let Some(id) = self.tables.type_constrs.find_by_name(name) {
+                                    types.insert(name.clone(), id);
+                                }
+                            }
+                        }
+                        ModBinding::Module(name, child) => {
+                            modules.insert(name.clone(), self.type_module_expr(child, &local_env)?);
+                        }
+                        ModBinding::ModuleType(name, sig) => {
+                            self.register_module_type(name, sig)?;
+                        }
+                        ModBinding::Expr(expr) => {
+                            self.type_expr(&local_env, expr)?;
+                        }
+                    }
+                }
+                Ok(ModuleSig::Struct {
+                    values,
+                    modules,
+                    types,
+                })
+            }
+            ModDesc::Functor(parameter, argument, body) => {
+                let argument = self.type_signature(argument, env)?;
+                let mut nested = self.module_sigs.clone();
+                nested.insert(parameter.clone(), argument.clone());
+                self.module_sigs = nested;
+                let result = self.type_module_expr(body, env)?;
+                Ok(ModuleSig::Functor {
+                    parameter: parameter.clone(),
+                    argument: Box::new(argument),
+                    result: Box::new(result),
+                })
+            }
+            ModDesc::Apply(function, args) => {
+                let mut signature = self.type_module_expr(function, env)?;
+                for arg in args {
+                    let argument = self.type_module_expr(arg, env)?;
+                    signature = match signature {
+                        ModuleSig::Functor {
+                            parameter,
+                            argument: parameter_sig,
+                            result,
+                        } => self.instantiate_module_signature(
+                            &parameter,
+                            &parameter_sig,
+                            &argument,
+                            &result,
+                        ),
+                        _ => return Err(TypeError::ApplicationOfNonFunction(module.loc)),
+                    };
+                    let _ = argument;
+                }
+                Ok(signature)
+            }
+            ModDesc::Seal(inner, sig) => {
+                let actual = self.type_module_expr(inner, env)?;
+                let expected = self.type_signature(sig, env)?;
+                self.match_module_signature(&actual, &expected, module.loc)?;
+                Ok(expected)
+            }
+        }
+    }
+
+    fn match_module_signature(
+        &self,
+        actual: &ModuleSig,
+        expected: &ModuleSig,
+        loc: Loc,
+    ) -> Result<(), TypeError> {
+        match (actual, expected) {
+            (
+                ModuleSig::Struct {
+                    values,
+                    modules,
+                    types: _,
+                },
+                ModuleSig::Struct {
+                    values: expected_values,
+                    modules: expected_modules,
+                    ..
+                },
+            ) => {
+                for name in expected_values.keys() {
+                    if !values.contains_key(name) {
+                        return Err(TypeError::UnboundValue(name.clone(), loc));
+                    }
+                }
+                for (name, expected_child) in expected_modules {
+                    let actual_child = modules
+                        .get(name)
+                        .ok_or_else(|| TypeError::UnboundValue(name.clone(), loc))?;
+                    self.match_module_signature(actual_child, expected_child, loc)?;
+                }
+                Ok(())
+            }
+            (ModuleSig::Functor { .. }, ModuleSig::Functor { .. }) => Ok(()),
+            _ => Err(TypeError::ExprWrongType(loc)),
         }
     }
 
@@ -2191,6 +2437,19 @@ impl<'a> TypeCtx<'a> {
 
             ExprDesc::RecordAccess(e, r) => {
                 let name = ref_name(r);
+                if let Some(path) = module_path(e) {
+                    let module_ty = self.module_signature_at(&path).and_then(|signature| {
+                        if let ModuleSig::Struct { values, .. } = signature {
+                            values.get(name).copied()
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(ty) = module_ty {
+                        return Ok(self.normalize_abbrev(ty));
+                    }
+                }
+
                 let lbl_id = self
                     .tables
                     .labels
@@ -2357,6 +2616,177 @@ impl<'a> TypeCtx<'a> {
         self.tables
             .types
             .alloc(TypDesc::Tconstr(self.builtins.exn, Vec::new()), NOTGENERIC)
+    }
+
+    fn module_signature_at(&self, path: &str) -> Option<&ModuleSig> {
+        let mut segments = path.split('.');
+        let first = segments.next()?;
+        let mut signature = self.module_sigs.get(first)?;
+        for segment in segments {
+            signature = match signature {
+                ModuleSig::Struct { modules, .. } => modules.get(segment)?,
+                ModuleSig::Functor { result, .. } => result,
+            };
+        }
+        Some(signature)
+    }
+
+    fn normalize_abbrev(&mut self, ty: TypId) -> TypId {
+        let ty = type_repr(&mut self.tables.types, ty);
+        match self.tables.types.get(ty).desc.clone() {
+            TypDesc::Tconstr(id, args) => {
+                if let TypeAbbrev::Tabbrev(params, body) =
+                    self.tables.type_constrs.get(id).info.ty_abbr.clone()
+                {
+                    let expanded = expand_abbrev(&mut self.tables.types, &params, body, &args);
+                    return self.normalize_abbrev(expanded);
+                }
+                let args = args
+                    .into_iter()
+                    .map(|arg| self.normalize_abbrev(arg))
+                    .collect();
+                self.tables
+                    .types
+                    .alloc(TypDesc::Tconstr(id, args), NOTGENERIC)
+            }
+            TypDesc::Tarrow(a, b) => {
+                let a = self.normalize_abbrev(a);
+                let b = self.normalize_abbrev(b);
+                type_arrow(&mut self.tables.types, a, b)
+            }
+            TypDesc::Tproduct(items) => {
+                let items = items
+                    .into_iter()
+                    .map(|item| self.normalize_abbrev(item))
+                    .collect();
+                type_product(&mut self.tables.types, items)
+            }
+            TypDesc::Tvar(_) => ty,
+        }
+    }
+
+    fn instantiate_module_signature(
+        &mut self,
+        _parameter: &str,
+        parameter: &ModuleSig,
+        argument: &ModuleSig,
+        result: &ModuleSig,
+    ) -> ModuleSig {
+        let mut replacements = HashMap::new();
+        if let (
+            ModuleSig::Struct {
+                types: parameter_types,
+                ..
+            },
+            ModuleSig::Struct {
+                types: argument_types,
+                ..
+            },
+        ) = (parameter, argument)
+        {
+            for (name, from) in parameter_types {
+                if let Some(to) = argument_types.get(name) {
+                    let actual = self.type_constructor_body(*to);
+                    replacements.insert(*from, actual);
+                }
+            }
+        }
+        self.substitute_module_signature(result, &replacements)
+    }
+
+    fn substitute_module_signature(
+        &mut self,
+        signature: &ModuleSig,
+        replacements: &HashMap<TypeConstrId, TypId>,
+    ) -> ModuleSig {
+        match signature {
+            ModuleSig::Struct {
+                values,
+                modules,
+                types,
+            } => ModuleSig::Struct {
+                values: values
+                    .iter()
+                    .map(|(name, ty)| {
+                        (name.clone(), self.substitute_type(*ty, replacements))
+                    })
+                    .collect(),
+                modules: modules
+                    .iter()
+                    .map(|(name, child)| {
+                        (
+                            name.clone(),
+                            self.substitute_module_signature(child, replacements),
+                        )
+                    })
+                    .collect(),
+                types: types.clone(),
+            },
+            ModuleSig::Functor {
+                parameter,
+                argument,
+                result,
+            } => ModuleSig::Functor {
+                parameter: parameter.clone(),
+                argument: Box::new(self.substitute_module_signature(argument, replacements)),
+                result: Box::new(self.substitute_module_signature(result, replacements)),
+            },
+        }
+    }
+
+    fn substitute_type(
+        &mut self,
+        ty: TypId,
+        replacements: &HashMap<TypeConstrId, TypId>,
+    ) -> TypId {
+        let ty = type_repr(&mut self.tables.types, ty);
+        match self.tables.types.get(ty).desc.clone() {
+            TypDesc::Tconstr(id, args) => {
+                if let Some(replacement) = replacements.get(&id) {
+                    if args.is_empty() {
+                        return self.substitute_type(*replacement, replacements);
+                    }
+                }
+                if let TypeAbbrev::Tabbrev(params, body) =
+                    self.tables.type_constrs.get(id).info.ty_abbr.clone()
+                {
+                    let expanded = expand_abbrev(&mut self.tables.types, &params, body, &args);
+                    return self.substitute_type(expanded, replacements);
+                }
+                let args = args
+                    .into_iter()
+                    .map(|arg| self.substitute_type(arg, replacements))
+                    .collect();
+                self.tables
+                    .types
+                    .alloc(TypDesc::Tconstr(id, args), NOTGENERIC)
+            }
+            TypDesc::Tarrow(a, b) => {
+                let a = self.substitute_type(a, replacements);
+                let b = self.substitute_type(b, replacements);
+                type_arrow(&mut self.tables.types, a, b)
+            }
+            TypDesc::Tproduct(items) => {
+                let items = items
+                    .into_iter()
+                    .map(|item| self.substitute_type(item, replacements))
+                    .collect();
+                type_product(&mut self.tables.types, items)
+            }
+            TypDesc::Tvar(_) => ty,
+        }
+    }
+
+    fn type_constructor_body(&mut self, id: TypeConstrId) -> TypId {
+        match self.tables.type_constrs.get(id).info.ty_abbr.clone() {
+            TypeAbbrev::Tabbrev(params, body) => {
+                expand_abbrev(&mut self.tables.types, &params, body, &[])
+            }
+            TypeAbbrev::Tnotabbrev => self
+                .tables
+                .types
+                .alloc(TypDesc::Tconstr(id, Vec::new()), NOTGENERIC),
+        }
     }
 
     pub fn type_expect(

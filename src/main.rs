@@ -10,10 +10,12 @@ mod types;
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use lalrpop_util::lalrpop_mod;
+use lalrpop_util::ParseError;
 
 use ast::ImplPhrase;
 use eval::Evaluator;
 use infer::{Env, TypeCtx, TypeError};
+use token::Tok;
 use types::{GlobalTables, TypDesc, TypId, TypLink};
 
 lalrpop_util::lalrpop_mod!(pub parser);
@@ -63,7 +65,7 @@ fn main() {
             };
             phrase.push_str(&line);
             phrase.push('\n');
-            if phrase.contains(";;") {
+            if repl_phrase_complete(&phrase, &mut names) {
                 process_input(
                     &phrase,
                     true,
@@ -78,12 +80,33 @@ fn main() {
                     print!("> ");
                     let _ = io::stdout().flush();
                 }
+
             }
         }
         if !phrase.trim().is_empty() {
             eprintln!("incomplete phrase: expected `;;`");
         }
     }
+}
+
+fn repl_phrase_complete(input: &str, names: &mut symbol::NameTable) -> bool {
+    let mut nesting = 0usize;
+    let lexer = match token::Lexer::new_with_names(input, names) {
+        Ok(lexer) => lexer,
+        Err(_) => return false,
+    };
+    for token in lexer {
+        let Ok((_, token, _)) = token else {
+            return false;
+        };
+        match token {
+            Tok::Sig | Tok::Struct | Tok::Begin => nesting += 1,
+            Tok::End => nesting = nesting.saturating_sub(1),
+            Tok::SemiSemi if nesting == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn process_input(
@@ -105,7 +128,7 @@ fn process_input(
     let phrases = match parser::ImplementationParser::new().parse(lexer) {
         Ok(phrases) => phrases,
         Err(error) => {
-            eprintln!("parse error: {error:?}");
+            report_parse_error(input, error);
             return;
         }
     };
@@ -215,12 +238,117 @@ fn process_input(
             ImplPhrase::Directive(_) => {
                 eprintln!("(Directive processing is not supported yet)");
             }
+            ImplPhrase::Module(name, module) => match evaluator.eval_module(&module) {
+                Ok(value) => {
+                    if let Err(err) = ctx.register_module(&name, &module, env) {
+                        report_type_error(&err);
+                    } else {
+                        evaluator.install_module(name, value);
+                    }
+                }
+                Err(err) => eprintln!("module evaluation error: {err}"),
+            },
+            ImplPhrase::ModuleType(name, sig) => {
+                if let Err(err) = ctx.register_module_type(&name, &sig) {
+                    report_type_error(&err);
+                }
+                if repl_mode {
+                    println!("module type {name} defined");
+                }
+            }
         }
     }
 }
 
 fn report_type_error(err: &TypeError) {
     eprintln!("type error: {err:?}");
+}
+
+fn report_parse_error(input: &str, error: ParseError<usize, Tok, token::LexicalError>) {
+    let (location, message) = match error {
+        ParseError::InvalidToken { location } => (
+            location,
+            "invalid token".to_owned(),
+        ),
+        ParseError::UnrecognizedEof { location, expected } => (
+            location,
+            format!("unexpected end of input; expected {}", expected_list(&expected)),
+        ),
+        ParseError::UnrecognizedToken {
+            token: (start, token, _),
+            expected,
+        } => (
+            start,
+            format!(
+                "unexpected {}; expected {}",
+                token_description(&token),
+                expected_list(&expected)
+            ),
+        ),
+        ParseError::ExtraToken {
+            token: (start, token, _),
+        } => (
+            start,
+            format!("unexpected extra {}", token_description(&token)),
+        ),
+        ParseError::User { error } => {
+            eprintln!("parse error: {error}");
+            return;
+        }
+    };
+
+    let (line, column, source_line, line_start) = source_position(input, location);
+    eprintln!("parse error at line {line}, column {column}: {message}");
+    if let Some(source_line) = source_line {
+        eprintln!("  {line} | {source_line}");
+        eprintln!(
+            "    | {}^",
+            " ".repeat(location.saturating_sub(line_start))
+        );
+    }
+}
+
+fn source_position(input: &str, location: usize) -> (usize, usize, Option<&str>, usize) {
+    let location = location.min(input.len());
+    let line_start = input[..location].rfind('\n').map_or(0, |index| index + 1);
+    let line = input[..location].bytes().filter(|&byte| byte == b'\n').count() + 1;
+    let column = input[line_start..location].chars().count() + 1;
+    let source_line = input[line_start..]
+        .split_once('\n')
+        .map_or_else(|| input[line_start..].strip_suffix('\r'), |(line, _)| {
+            Some(line.strip_suffix('\r').unwrap_or(line))
+        });
+    (line, column, source_line, line_start)
+}
+
+fn expected_list(expected: &[String]) -> String {
+    match expected {
+        [] => "no token".to_owned(),
+        [only] => format!("`{only}`"),
+        many => many
+            .iter()
+            .map(|item| format!("`{item}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
+fn token_description(token: &Tok) -> String {
+    match token {
+        Tok::Ident(name) => format!("identifier `{name}`"),
+        Tok::Int(value) => format!("integer `{value}`"),
+        Tok::Float(value) => format!("float `{value}`"),
+        Tok::Str(value) => format!("string literal {value:?}"),
+        Tok::Char(value) => format!("character literal {value:?}"),
+        Tok::SemiSemi => "`;;`".to_owned(),
+        Tok::LParen => "`(`".to_owned(),
+        Tok::RParen => "`)`".to_owned(),
+        Tok::Dot => "`.`".to_owned(),
+        Tok::Equal => "`=`".to_owned(),
+        Tok::Colon => "`:`".to_owned(),
+        Tok::MinusGreater => "`->`".to_owned(),
+        other => format!("`{other:?}`"),
+    }
 }
 
 fn fmt_type(tables: &mut GlobalTables, ty: TypId) -> String {
